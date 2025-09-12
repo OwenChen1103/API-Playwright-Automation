@@ -744,6 +744,9 @@ class ExistingBrowserMonitor:
   // 初始化模板變數
   window.__req_template__ = window.__req_template__ || null;
   
+  // ✅ 添加強制立即執行一次的入口
+  window.__poller_force_now__ = () => { window.__poller_force_flag__ = true; };
+  
   window.__result_poller__ = async (opts) => {
     const state = { etag: null, seen: new Set(), consecutiveFails: 0 };
     let lastMaxRound = 0; // 只處理比它新的 round_id
@@ -754,6 +757,12 @@ class ExistingBrowserMonitor:
 
     while (true) {
       try {
+        // ✅ 檢查是否需要強制立即執行
+        if (window.__poller_force_flag__) {
+          window.__poller_force_flag__ = false;
+          console.debug('[POLLER] Force trigger activated');
+        }
+
         // 這裡每輪都算出時間窗
         const now = new Date();
         const pad = (n)=> (n<10?'0':'')+n;
@@ -821,6 +830,7 @@ class ExistingBrowserMonitor:
             credentials:'include', cache:'no-store',
             body: JSON.stringify({ startTime, endTime, pageIndex:1, pageSize:100 })
           });
+          console.debug('[POLLER] used default payload →', resp.status);   // ← 新增這行
         }
 
         // 處理非OK狀態
@@ -923,26 +933,144 @@ class ExistingBrowserMonitor:
 
     async def soft_refresh_every(self, seconds: int = 8):
         """
-        每隔幾秒進行軟刷新（點擊頁面刷新按鈕而非整頁 reload）
+        智慧輕刷新：模擬人真的按了「查詢/刷新」，讓站方的 JS 把快照重建、再發出 XHR
+        現在針對所有同源 iframe 進行嘗試
         """
-        logger.info(f"Starting soft refresh every {seconds} seconds")
+        logger.info(f"Starting smart soft refresh every {seconds} seconds")
         while self.is_running:
             try:
-                await self.page.evaluate("""
-                  // 1) 若有前端的刷新函式就叫它（自行替換判斷）
-                  if (window.app && app.store && app.store.fetch) { 
-                    app.store.fetch(); 
-                    console.debug('[SOFT_REFRESH] Called app.store.fetch()');
-                  }
-                  // 2) 否則嘗試點「刷新」按鈕（請把選擇器換成真實的）
-                  const btn = document.querySelector('button.refresh, button:has-text("刷新"), .reload-btn, [class*="refresh"], [class*="reload"]');
-                  if (btn && btn.click) { 
-                    btn.click(); 
-                    console.debug('[SOFT_REFRESH] Clicked refresh button');
-                  }
-                """)
+                logger.debug(f"[SOFT_REFRESH] Starting refresh cycle, is_running={self.is_running}")
+                
+                # 針對主頁面和所有同源 iframe 都執行軟刷新
+                if not self.page:
+                    logger.warning(f"[SOFT_REFRESH] Page is None, skipping refresh cycle")
+                    await asyncio.sleep(seconds)
+                    continue
+                    
+                frames = self.page.frames
+                logger.debug(f"[SOFT_REFRESH] Found {len(frames)} frames to check")
+                
+                for i, frame in enumerate(frames):
+                    try:
+                        frame_url = frame.url
+                        logger.debug(f"[SOFT_REFRESH] Checking frame {i}: {frame_url}")
+                        
+                        if not frame_url or "t9live3.vip" not in frame_url:
+                            logger.debug(f"[SOFT_REFRESH] Skipping frame {i} - not t9live3 domain")
+                            continue
+                        
+                        success = await frame.evaluate("""
+                        (() => {
+                          const T_NOW = Date.now();
+                          const byText = (el) => (el.innerText || el.textContent || "").trim();
+
+                          // 深度遍歷 (含 shadowRoot)
+                          const all = [];
+                          const walk = (root) => {
+                            const iter = document.createNodeIterator(root, NodeFilter.SHOW_ELEMENT);
+                            for (let n = iter.nextNode(); n; n = iter.nextNode()) {
+                              all.push(n);
+                              if (n.shadowRoot) walk(n.shadowRoot);
+                            }
+                            // 也掃一次常見的 open shadow 裏的 button
+                            (root.querySelectorAll?.('slot') || []).forEach(slot => {
+                              slot.assignedElements?.().forEach(el => { all.push(el); if (el.shadowRoot) walk(el.shadowRoot); });
+                            });
+                          };
+                          walk(document);
+
+                          const click = (el, why) => {
+                            try {
+                              el.click?.(); // 先用原生 click（許多框架綁 onClick）
+                              el.dispatchEvent?.(new MouseEvent('click', {bubbles:true, cancelable:true}));
+                              console.debug('[SOFT_REFRESH] Clicked:', why, '→', (byText(el) || el.className || el.id || el.tagName));
+                              return true;
+                            } catch (e) {
+                              console.debug('[SOFT_REFRESH] click failed:', e.message);
+                              return false;
+                            }
+                          };
+
+                          const kw = /刷新|查詢|查询|搜尋|搜索|查找|更新|重新整理|Search|Refresh|Reload|Update/;
+
+                          // 1) 直接看文字命中
+                          let btn = all.find(el =>
+                            (el.matches?.('button,[role="button"],.el-button,.ant-btn,.btn,a[role="button"],a.button')) &&
+                            kw.test(byText(el))
+                          );
+                          if (btn && click(btn, 'byText')) return true;
+
+                          // 2) 常見 UI 類名/圖示（Element/Ant/自定義 icon）
+                          btn = all.find(el =>
+                            el.matches?.('[class*="refresh"],[class*="reload"],[class*="search"],[data-action*="refresh"],[data-action*="search"],.el-button--primary,.ant-btn-primary')
+                          );
+                          if (btn && click(btn, 'byClass')) return true;
+
+                          // 3) 沒命中就 bump hash 促使路由重取
+                          try {
+                            const hash = (location.hash || '#/').split('?')[0];
+                            const p = new URLSearchParams((location.hash.split('?')[1]||''));
+                            p.set('_ts', String(T_NOW));
+                            const nh = hash + '?' + p.toString();
+                            if (nh !== location.hash) { location.hash = nh; console.debug('[SOFT_REFRESH] Bumped hash'); return true; }
+                          } catch (e) {}
+
+                          // 4) 實在沒招，發自訂事件
+                          try { (document.querySelector('#app') || document.body)
+                                .dispatchEvent(new Event('force-fetch', {bubbles:true})); 
+                                console.debug('[SOFT_REFRESH] Dispatched force-fetch'); 
+                                return true; } catch(e){}
+
+                          console.debug('[SOFT_REFRESH] No trigger');
+                          return false;
+                        })();
+                        """)
+                        
+                        if success:
+                            logger.info(f"[SOFT_REFRESH] Triggered successfully in frame: {frame_url}")
+
+                            # 1) 先給頁面 3 秒時間，看它會不會真的發出 XHR
+                            try:
+                                await self.page.wait_for_response(
+                                    lambda r: ("i.t9live3.vip/api/game/result/search" in r.url) and
+                                              (getattr(r.request, "resource_type", "") in ("xhr", "fetch")),
+                                    timeout=3_000
+                                )
+                                logger.info("[SOFT_REFRESH] Observed search XHR from page")
+                            except Exception:
+                                # 2) 如果 3 秒內完全沒有 XHR，就直接由我們自己拉一次（不等下一輪）
+                                logger.warning("[SOFT_REFRESH] No XHR observed — falling back to direct pull")
+                                try:
+                                    data = await self.make_api_request()                # 直接在頁內 fetch
+                                    if data and not data.get("_err"):
+                                        records = self.extract_records(data)
+                                        if records:
+                                            ok = await self.send_to_ingest(records)
+                                            if ok:
+                                                self.stats["records_processed"] += len(records)
+                                                logger.info(f"[FALLBACK] pulled {len(records)} records via make_api_request()")
+                                except Exception as e:
+                                    logger.error(f"[FALLBACK] direct pull failed: {e}")
+
+                            # 3) 最後再催一次 poller（你已有 window.__poller_force_now__）
+                            try:
+                                await self.page.evaluate("window.__poller_force_now__ && window.__poller_force_now__()")
+                            except Exception:
+                                pass
+
+                            break
+                        else:
+                            logger.debug(f"[SOFT_REFRESH] No suitable trigger found in frame: {frame_url}")
+                            
+                    except Exception as e:
+                        logger.debug(f"[SOFT_REFRESH] Error in frame {frame.url}: {e}")
+                        continue
+                
+                logger.debug(f"[SOFT_REFRESH] Refresh cycle complete, sleeping for {seconds} seconds")
+                    
             except Exception as e:
-                logger.debug(f"Soft refresh error: {e}")
+                logger.error(f"[SOFT_REFRESH] General error: {e}")
+                
             await asyncio.sleep(seconds)
                 
     async def _handle_consecutive_failures(self):
@@ -999,14 +1127,14 @@ class ExistingBrowserMonitor:
             except Exception as e:
                 logger.warning(f"Template discovery skipped: {e}")
             
+            # ✅ 先標記正在跑
+            self.is_running = True
+            
             # 启动頁內輪詢器
             await self.start_poller(interval_ms=1000)
             
             # 啟動軟刷新（可選，背景執行）
             soft_refresh_task = asyncio.create_task(self.soft_refresh_every(8))
-            
-            # 启动监控
-            self.is_running = True
             
             try:
                 await self.monitor_loop()
