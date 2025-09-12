@@ -1,0 +1,448 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>T9 遊戲結果即時監控</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #1a1a1a; color: #fff; }
+        .container { max-width: 1600px; margin: 0 auto; padding: 20px; }
+        .header { text-align: center; margin-bottom: 30px; }
+        .title { font-size: 2.5rem; font-weight: 600; margin-bottom: 10px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+        .subtitle { color: #888; font-size: 1.1rem; }
+        
+        .connection-status { display: flex; align-items: center; gap: 8px; margin-bottom: 20px; }
+        .status-indicator { width: 12px; height: 12px; border-radius: 50%; background: #ef4444; }
+        .status-indicator.connected { background: #4ade80; }
+        .status-indicator.connecting { background: #fbbf24; animation: pulse 1s infinite; }
+        
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+        
+        .btn { padding: 8px 16px; border: none; border-radius: 6px; cursor: pointer; font-weight: 500; transition: all 0.2s; }
+        .btn-primary { background: #667eea; color: white; }
+        .btn-primary:hover { background: #5a6fd8; }
+        .btn-secondary { background: #6b7280; color: white; }
+        .btn-secondary:hover { background: #5f656d; }
+        
+        .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 30px; }
+        .stat-card { background: #2a2a2a; border: 1px solid #333; border-radius: 8px; padding: 15px; }
+        .stat-title { font-size: 0.9rem; color: #888; margin-bottom: 5px; }
+        .stat-value { font-size: 1.5rem; font-weight: 600; }
+        .stat-value.success { color: #4ade80; }
+        .stat-value.warning { color: #fbbf24; }
+        .stat-value.error { color: #ef4444; }
+        
+        .main-content { display: grid; grid-template-columns: 1fr 400px; gap: 20px; height: 70vh; }
+        .panel { background: #2a2a2a; border: 1px solid #333; border-radius: 8px; overflow: hidden; }
+        .panel-header { background: #333; padding: 15px; font-weight: 600; border-bottom: 1px solid #444; }
+        .panel-content { height: calc(100% - 60px); overflow-y: auto; padding: 15px; }
+        
+        .game-table { width: 100%; }
+        .game-table th, .game-table td { padding: 8px 12px; text-align: left; border-bottom: 1px solid #333; }
+        .game-table th { background: #333; color: #aaa; font-size: 0.9rem; }
+        .game-table tr:nth-child(even) { background: #1a1a1a; }
+        .game-table tr.fresh { background: #0d4f3c; animation: fadeIn 0.5s ease-in; }
+        
+        @keyframes fadeIn { from { opacity: 0; background: #1a472a; } to { opacity: 1; background: #0d4f3c; } }
+        
+        .event-item { margin-bottom: 10px; padding: 12px; background: #1a1a1a; border: 1px solid #333; border-radius: 6px; border-left: 4px solid #667eea; }
+        .event-item.result { border-left-color: #4ade80; }
+        .event-item.error { border-left-color: #ef4444; }
+        .event-item.heartbeat { border-left-color: #fbbf24; }
+        
+        .event-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+        .event-type { font-size: 0.8rem; padding: 2px 6px; border-radius: 4px; background: #333; }
+        .event-time { font-size: 0.8rem; color: #888; }
+        .event-content { font-size: 0.9rem; }
+        .event-content pre { background: #111; padding: 8px; border-radius: 4px; overflow-x: auto; font-size: 0.8rem; }
+        
+        .badge { padding: 2px 6px; border-radius: 3px; font-size: 0.8rem; }
+        .badge-success { background: #166534; color: #86efac; }
+        .badge-danger { background: #7f1d1d; color: #fca5a5; }
+        .badge-warning { background: #92400e; color: #fbbf24; }
+        .badge-info { background: #1e3a8a; color: #93c5fd; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header class="header">
+            <h1 class="title">T9 遊戲結果即時監控</h1>
+            <p class="subtitle">基於 SSE 的零延遲遊戲結果監控系統</p>
+        </header>
+
+        <div class="connection-status">
+            <div class="status-indicator" id="connectionStatus"></div>
+            <span id="connectionText">未連接</span>
+            <button class="btn btn-primary" id="connectBtn" onclick="toggleConnection()">連接</button>
+            <button class="btn btn-secondary" onclick="clearResults()">清空結果</button>
+            <button class="btn btn-secondary" onclick="resetStats()">重置統計</button>
+        </div>
+
+        <div class="stats">
+            <div class="stat-card">
+                <div class="stat-title">連接時間</div>
+                <div class="stat-value" id="connectionTime">--</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-title">接收結果</div>
+                <div class="stat-value success" id="totalResults">0</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-title">TTFD (首筆)</div>
+                <div class="stat-value" id="ttfdValue">--</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-title">結果/分鐘</div>
+                <div class="stat-value" id="resultsPerMinute">0</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-title">最後更新</div>
+                <div class="stat-value" id="lastUpdate">--</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-title">錯誤數</div>
+                <div class="stat-value error" id="errorCount">0</div>
+            </div>
+        </div>
+
+        <div class="main-content">
+            <div class="panel">
+                <div class="panel-header">遊戲結果 (最新 100 筆)</div>
+                <div class="panel-content">
+                    <table class="game-table" id="gameTable">
+                        <thead>
+                            <tr>
+                                <th>局號</th>
+                                <th>桌號</th>
+                                <th>開局時間</th>
+                                <th>結果</th>
+                                <th>狀態</th>
+                            </tr>
+                        </thead>
+                        <tbody id="gameTableBody">
+                            <tr>
+                                <td colspan="5" style="text-align: center; color: #888;">等待連接...</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+            <div class="panel">
+                <div class="panel-header">系統事件</div>
+                <div class="panel-content" id="eventsList">
+                    <div style="text-align: center; color: #888;">等待事件...</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let eventSource = null;
+        let isConnected = false;
+        let connectionStartTime = null;
+        let firstResultTime = null;
+        let resultCount = 0;
+        let errorCount = 0;
+        let gameResults = [];
+        let resultTimes = [];
+
+        const elements = {
+            status: document.getElementById('connectionStatus'),
+            text: document.getElementById('connectionText'),
+            connectBtn: document.getElementById('connectBtn'),
+            eventsList: document.getElementById('eventsList'),
+            gameTableBody: document.getElementById('gameTableBody'),
+            totalResults: document.getElementById('totalResults'),
+            ttfdValue: document.getElementById('ttfdValue'),
+            resultsPerMinute: document.getElementById('resultsPerMinute'),
+            lastUpdate: document.getElementById('lastUpdate'),
+            errorCount: document.getElementById('errorCount'),
+            connectionTime: document.getElementById('connectionTime')
+        };
+
+        function toggleConnection() {
+            if (isConnected) {
+                disconnect();
+            } else {
+                connect();
+            }
+        }
+
+        function connect() {
+            const url = 'http://127.0.0.1:8000/api/stream?event_types=result,error,heartbeat';
+            
+            connectionStartTime = Date.now();
+            firstResultTime = null;
+
+            elements.status.className = 'status-indicator connecting';
+            elements.text.textContent = '連接中...';
+            elements.connectBtn.textContent = '取消';
+
+            eventSource = new EventSource(url);
+
+            eventSource.onopen = function() {
+                isConnected = true;
+                elements.status.className = 'status-indicator connected';
+                elements.text.textContent = '已連接';
+                elements.connectBtn.textContent = '斷開';
+                
+                const connectTime = Date.now() - connectionStartTime;
+                elements.connectionTime.textContent = connectTime + 'ms';
+                
+                addEvent('system', '連接建立', { url: url, connectTime: connectTime });
+            };
+
+            eventSource.addEventListener('result', function(event) {
+                try {
+                    const data = JSON.parse(event.data);
+                    handleGameResult(data);
+                } catch (e) {
+                    console.error('解析結果數據失敗:', e);
+                }
+            });
+
+            eventSource.addEventListener('error', function(event) {
+                try {
+                    const data = JSON.parse(event.data);
+                    handleError(data);
+                } catch (e) {
+                    console.error('解析錯誤數據失敗:', e);
+                }
+            });
+
+            eventSource.addEventListener('heartbeat', function(event) {
+                try {
+                    const data = JSON.parse(event.data);
+                    handleHeartbeat(data);
+                } catch (e) {
+                    console.error('解析心跳數據失敗:', e);
+                }
+            });
+
+            eventSource.onmessage = function(event) {
+                try {
+                    const data = JSON.parse(event.data);
+                    addEvent(data.event_type || 'message', '通用事件', data);
+                } catch (e) {
+                    console.error('解析通用事件失敗:', e);
+                }
+            };
+
+            eventSource.onerror = function(event) {
+                console.error('SSE 連接錯誤:', event);
+                errorCount++;
+                elements.errorCount.textContent = errorCount;
+                
+                if (!isConnected) {
+                    elements.status.className = 'status-indicator';
+                    elements.text.textContent = '連接失敗';
+                    elements.connectBtn.textContent = '重連';
+                }
+                
+                addEvent('error', '連接錯誤', { error: event });
+            };
+        }
+
+        function disconnect() {
+            if (eventSource) {
+                eventSource.close();
+                eventSource = null;
+            }
+            
+            isConnected = false;
+            elements.status.className = 'status-indicator';
+            elements.text.textContent = '已斷開';
+            elements.connectBtn.textContent = '連接';
+            
+            addEvent('system', '連接斷開', {});
+        }
+
+        function handleGameResult(data) {
+            resultCount++;
+            elements.totalResults.textContent = resultCount;
+
+            // 記錄 TTFD
+            if (!firstResultTime) {
+                firstResultTime = Date.now();
+                const ttfd = firstResultTime - connectionStartTime;
+                elements.ttfdValue.textContent = ttfd + 'ms';
+                elements.ttfdValue.className = 'stat-value ' + (ttfd <= 300 ? 'success' : ttfd <= 800 ? 'warning' : 'error');
+            }
+
+            // 更新速率統計
+            const now = Date.now();
+            resultTimes.push(now);
+            if (resultTimes.length > 100) resultTimes.shift(); // 只保留最近 100 個
+            
+            if (resultTimes.length > 1) {
+                const timeSpan = (resultTimes[resultTimes.length - 1] - resultTimes[0]) / 1000;
+                const rate = (resultTimes.length - 1) / timeSpan * 60; // 每分鐘
+                elements.resultsPerMinute.textContent = rate.toFixed(1);
+            }
+
+            // 更新最後時間
+            elements.lastUpdate.textContent = new Date().toLocaleTimeString();
+
+            // 處理遊戲結果數據
+            if (data.payload && data.payload.results) {
+                for (const result of data.payload.results) {
+                    addGameResult(result);
+                }
+            } else if (data.payload) {
+                addGameResult(data.payload);
+            }
+
+            addEvent('result', `收到 ${data.payload?.results?.length || 1} 筆遊戲結果`, {
+                count: data.payload?.results?.length || 1,
+                latency: data.latency_ms || 'N/A'
+            });
+        }
+
+        function handleError(data) {
+            errorCount++;
+            elements.errorCount.textContent = errorCount;
+            addEvent('error', '系統錯誤: ' + (data.payload?.error || '未知錯誤'), data.payload);
+        }
+
+        function handleHeartbeat(data) {
+            addEvent('heartbeat', '心跳檢測', {
+                timestamp: data.payload?.timestamp,
+                latency: data.latency_ms || 'N/A'
+            });
+        }
+
+        function addGameResult(result) {
+            const roundId = result.round_id || result.roundId || result.id || 'N/A';
+            const tableId = result.table_id || result.tableId || result.table || 'N/A';
+            const startTime = result.game_start_time || result.openTime || result.start_time || 'N/A';
+            const gameResult = result.result || result.outcome || 'N/A';
+            const status = result.status || (result.finished ? '已結束' : '進行中');
+
+            // 添加到結果列表
+            gameResults.unshift({
+                roundId,
+                tableId,
+                startTime,
+                gameResult,
+                status,
+                timestamp: Date.now()
+            });
+
+            // 只保留最新 100 筆
+            if (gameResults.length > 100) {
+                gameResults = gameResults.slice(0, 100);
+            }
+
+            updateGameTable();
+        }
+
+        function updateGameTable() {
+            const tbody = elements.gameTableBody;
+            tbody.innerHTML = '';
+
+            if (gameResults.length === 0) {
+                const row = tbody.insertRow();
+                const cell = row.insertCell(0);
+                cell.colSpan = 5;
+                cell.style.textAlign = 'center';
+                cell.style.color = '#888';
+                cell.textContent = '暫無遊戲結果';
+                return;
+            }
+
+            gameResults.forEach((result, index) => {
+                const row = tbody.insertRow();
+                if (index < 5) row.className = 'fresh'; // 最新 5 筆標記為新增
+
+                row.insertCell(0).textContent = result.roundId;
+                row.insertCell(1).textContent = result.tableId;
+                row.insertCell(2).textContent = formatTime(result.startTime);
+                row.insertCell(3).textContent = result.gameResult;
+                
+                const statusCell = row.insertCell(4);
+                const statusBadge = document.createElement('span');
+                statusBadge.className = 'badge ' + getStatusBadgeClass(result.status);
+                statusBadge.textContent = result.status;
+                statusCell.appendChild(statusBadge);
+            });
+        }
+
+        function formatTime(timeStr) {
+            if (!timeStr || timeStr === 'N/A') return 'N/A';
+            try {
+                if (typeof timeStr === 'string' && timeStr.includes(':')) {
+                    return timeStr; // 已經是時間格式
+                }
+                const date = new Date(timeStr);
+                return date.toLocaleTimeString();
+            } catch (e) {
+                return timeStr;
+            }
+        }
+
+        function getStatusBadgeClass(status) {
+            if (status === '已結束' || status === 'finished') return 'badge-success';
+            if (status === '進行中' || status === 'running') return 'badge-info';
+            if (status === '錯誤' || status === 'error') return 'badge-danger';
+            return 'badge-warning';
+        }
+
+        function addEvent(type, title, payload) {
+            const eventItem = document.createElement('div');
+            eventItem.className = 'event-item ' + type;
+            
+            const now = new Date();
+            const timeStr = now.toLocaleTimeString();
+            
+            eventItem.innerHTML = `
+                <div class="event-header">
+                    <span class="event-type">${type}</span>
+                    <span class="event-time">${timeStr}</span>
+                </div>
+                <div class="event-content">
+                    <strong>${title}</strong>
+                    ${payload && Object.keys(payload).length > 0 ? `<pre>${JSON.stringify(payload, null, 2)}</pre>` : ''}
+                </div>
+            `;
+
+            elements.eventsList.insertBefore(eventItem, elements.eventsList.firstChild);
+            
+            // 只保留最新 20 個事件
+            while (elements.eventsList.children.length > 20) {
+                elements.eventsList.removeChild(elements.eventsList.lastChild);
+            }
+        }
+
+        function clearResults() {
+            gameResults = [];
+            updateGameTable();
+            elements.eventsList.innerHTML = '<div style="text-align: center; color: #888;">事件已清空</div>';
+        }
+
+        function resetStats() {
+            resultCount = 0;
+            errorCount = 0;
+            resultTimes = [];
+            firstResultTime = null;
+            gameResults = [];
+            
+            elements.totalResults.textContent = '0';
+            elements.errorCount.textContent = '0';
+            elements.ttfdValue.textContent = '--';
+            elements.resultsPerMinute.textContent = '0';
+            elements.lastUpdate.textContent = '--';
+            
+            updateGameTable();
+            clearResults();
+        }
+
+        // 自動連接
+        setTimeout(() => {
+            if (!isConnected) {
+                connect();
+            }
+        }, 1000);
+    </script>
+</body>
+</html>

@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>T9 Live SSE Demo Client</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #1a1a1a; color: #fff; }
+        .container { max-width: 1400px; margin: 0 auto; padding: 20px; }
+        .header { text-align: center; margin-bottom: 30px; }
+        .title { font-size: 2.5rem; font-weight: 600; margin-bottom: 10px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+        .subtitle { color: #888; font-size: 1.1rem; }
+        
+        .controls { display: flex; gap: 15px; margin-bottom: 30px; flex-wrap: wrap; }
+        .control-group { display: flex; align-items: center; gap: 10px; }
+        .control-group label { font-weight: 500; min-width: 80px; }
+        .control-group select, .control-group input { padding: 8px 12px; border: 1px solid #333; border-radius: 6px; background: #2a2a2a; color: #fff; }
+        
+        .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 30px; }
+        .stat-card { background: #2a2a2a; border: 1px solid #333; border-radius: 8px; padding: 15px; }
+        .stat-title { font-size: 0.9rem; color: #888; margin-bottom: 5px; }
+        .stat-value { font-size: 1.5rem; font-weight: 600; }
+        .stat-value.success { color: #4ade80; }
+        .stat-value.warning { color: #fbbf24; }
+        .stat-value.error { color: #ef4444; }
+        
+        .events-container { display: grid; grid-template-columns: 1fr 300px; gap: 20px; height: 600px; }
+        .events-panel { background: #2a2a2a; border: 1px solid #333; border-radius: 8px; overflow: hidden; }
+        .panel-header { background: #333; padding: 15px; font-weight: 600; border-bottom: 1px solid #444; }
+        .events-list { height: calc(100% - 60px); overflow-y: auto; padding: 10px; }
+        
+        .event-item { margin-bottom: 10px; padding: 12px; background: #1a1a1a; border: 1px solid #333; border-radius: 6px; border-left: 4px solid #667eea; }
+        .event-item.result { border-left-color: #4ade80; }
+        .event-item.error { border-left-color: #ef4444; }
+        .event-item.heartbeat { border-left-color: #fbbf24; }
+        
+        .event-header { display: flex; justify-content: between; align-items: center; margin-bottom: 8px; }
+        .event-type { font-size: 0.8rem; padding: 2px 6px; border-radius: 4px; background: #333; }
+        .event-time { font-size: 0.8rem; color: #888; }
+        .event-content { font-size: 0.9rem; }
+        .event-content pre { background: #111; padding: 8px; border-radius: 4px; overflow-x: auto; font-size: 0.8rem; }
+        
+        .connection-status { display: flex; align-items: center; gap: 8px; margin-bottom: 20px; }
+        .status-indicator { width: 12px; height: 12px; border-radius: 50%; background: #ef4444; }
+        .status-indicator.connected { background: #4ade80; }
+        .status-indicator.connecting { background: #fbbf24; animation: pulse 1s infinite; }
+        
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+        
+        .btn { padding: 8px 16px; border: none; border-radius: 6px; cursor: pointer; font-weight: 500; transition: all 0.2s; }
+        .btn-primary { background: #667eea; color: white; }
+        .btn-primary:hover { background: #5a6fd8; }
+        .btn-secondary { background: #6b7280; color: white; }
+        .btn-secondary:hover { background: #5f656d; }
+        .btn-danger { background: #ef4444; color: white; }
+        .btn-danger:hover { background: #dc2626; }
+        
+        .metrics-panel { }
+        .metrics-list { }
+        .metric-item { display: flex; justify-content: space-between; margin-bottom: 8px; padding: 8px; background: #1a1a1a; border-radius: 4px; }
+        .metric-label { color: #888; font-size: 0.9rem; }
+        .metric-value { font-weight: 500; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header class="header">
+            <h1 class="title">T9 Live SSE Demo</h1>
+            <p class="subtitle">實時數據流監控演示客戶端</p>
+        </header>
+
+        <div class="connection-status">
+            <div class="status-indicator" id="connectionStatus"></div>
+            <span id="connectionText">未連接</span>
+            <button class="btn btn-primary" id="connectBtn" onclick="toggleConnection()">連接</button>
+            <button class="btn btn-secondary" onclick="clearEvents()">清空事件</button>
+            <button class="btn btn-danger" onclick="resetStats()">重置統計</button>
+        </div>
+
+        <div class="controls">
+            <div class="control-group">
+                <label>事件過濾:</label>
+                <select id="eventFilter" onchange="updateFilter()">
+                    <option value="">全部事件</option>
+                    <option value="result">結果事件</option>
+                    <option value="result,error">結果+錯誤</option>
+                    <option value="heartbeat">心跳事件</option>
+                </select>
+            </div>
+            <div class="control-group">
+                <label>任務ID:</label>
+                <input type="text" id="jobIdFilter" placeholder="可選" onchange="updateFilter()">
+            </div>
+        </div>
+
+        <div class="stats">
+            <div class="stat-card">
+                <div class="stat-title">連接時間</div>
+                <div class="stat-value" id="connectionTime">--</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-title">接收事件</div>
+                <div class="stat-value success" id="totalEvents">0</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-title">TTFD (首條)</div>
+                <div class="stat-value" id="ttfdValue">--</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-title">平均延遲</div>
+                <div class="stat-value" id="avgLatency">--</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-title">事件/秒</div>
+                <div class="stat-value" id="eventsPerSecond">0</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-title">錯誤數</div>
+                <div class="stat-value error" id="errorCount">0</div>
+            </div>
+        </div>
+
+        <div class="events-container">
+            <div class="events-panel">
+                <div class="panel-header">實時事件流</div>
+                <div class="events-list" id="eventsList"></div>
+            </div>
+            <div class="metrics-panel">
+                <div class="panel-header">系統指標</div>
+                <div class="metrics-list" id="metricsList">
+                    <div class="metric-item">
+                        <span class="metric-label">點擊「更新指標」載入</span>
+                        <button class="btn btn-secondary" onclick="loadMetrics()">更新指標</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let eventSource = null;
+        let isConnected = false;
+        let connectionStartTime = null;
+        let firstEventTime = null;
+        let eventCount = 0;
+        let errorCount = 0;
+        let eventTimes = [];
+        let lastEventTime = Date.now();
+
+        const elements = {
+            status: document.getElementById('connectionStatus'),
+            text: document.getElementById('connectionText'),
+            connectBtn: document.getElementById('connectBtn'),
+            eventsList: document.getElementById('eventsList'),
+            totalEvents: document.getElementById('totalEvents'),
+            ttfdValue: document.getElementById('ttfdValue'),
+            avgLatency: document.getElementById('avgLatency'),
+            eventsPerSecond: document.getElementById('eventsPerSecond'),
+            errorCount: document.getElementById('errorCount'),
+            connectionTime: document.getElementById('connectionTime'),
+            metricsList: document.getElementById('metricsList')
+        };
+
+        function toggleConnection() {
+            if (isConnected) {
+                disconnect();
+            } else {
+                connect();
+            }
+        }
+
+        function connect() {
+            const eventFilter = document.getElementById('eventFilter').value;
+            const jobId = document.getElementById('jobIdFilter').value.trim();
+            
+            let url = 'http://127.0.0.1:8000/api/stream';
+            const params = new URLSearchParams();
+            if (eventFilter) params.append('event_types', eventFilter);
+            if (jobId) params.append('job_id', jobId);
+            if (params.toString()) url += '?' + params.toString();
+
+            connectionStartTime = Date.now();
+            firstEventTime = null;
+
+            elements.status.className = 'status-indicator connecting';
+            elements.text.textContent = '連接中...';
+            elements.connectBtn.textContent = '取消';
+
+            eventSource = new EventSource(url);
+
+            eventSource.onopen = function() {
+                isConnected = true;
+                elements.status.className = 'status-indicator connected';
+                elements.text.textContent = '已連接';
+                elements.connectBtn.textContent = '斷開';
+                
+                const connectTime = Date.now() - connectionStartTime;
+                elements.connectionTime.textContent = connectTime + 'ms';
+                
+                addEvent('system', '連接建立', { url: url, connectTime: connectTime });
+            };
+
+            eventSource.onmessage = function(event) {
+                try {
+                    const data = JSON.parse(event.data);
+                    handleEvent(data);
+                } catch (e) {
+                    console.error('解析事件數據失敗:', e);
+                }
+            };
+
+            eventSource.onerror = function(event) {
+                console.error('SSE 連接錯誤:', event);
+                errorCount++;
+                elements.errorCount.textContent = errorCount;
+                
+                if (!isConnected) {
+                    elements.status.className = 'status-indicator';
+                    elements.text.textContent = '連接失敗';
+                    elements.connectBtn.textContent = '重連';
+                }
+            };
+        }
+
+        function disconnect() {
+            if (eventSource) {
+                eventSource.close();
+                eventSource = null;
+            }
+            
+            isConnected = false;
+            elements.status.className = 'status-indicator';
+            elements.text.textContent = '已斷開';
+            elements.connectBtn.textContent = '連接';
+            
+            addEvent('system', '連接斷開', {});
+        }
+
+        function handleEvent(data) {
+            eventCount++;
+            elements.totalEvents.textContent = eventCount;
+
+            // 記錄 TTFD
+            if (!firstEventTime && data.event_type !== 'connected') {
+                firstEventTime = Date.now();
+                const ttfd = firstEventTime - connectionStartTime;
+                elements.ttfdValue.textContent = ttfd + 'ms';
+                elements.ttfdValue.className = 'stat-value ' + (ttfd <= 300 ? 'success' : ttfd <= 800 ? 'warning' : 'error');
+            }
+
+            // 計算延遲
+            if (data.latency_ms) {
+                eventTimes.push(data.latency_ms);
+                if (eventTimes.length > 100) eventTimes.shift(); // 只保留最近 100 個
+                
+                const avgLatency = eventTimes.reduce((a, b) => a + b, 0) / eventTimes.length;
+                elements.avgLatency.textContent = Math.round(avgLatency) + 'ms';
+            }
+
+            // 計算事件速率
+            const now = Date.now();
+            if (now - lastEventTime > 1000) {
+                const rate = eventCount / ((now - connectionStartTime) / 1000);
+                elements.eventsPerSecond.textContent = rate.toFixed(1);
+                lastEventTime = now;
+            }
+
+            // 顯示事件
+            addEvent(data.event_type, formatEventContent(data), data.payload);
+        }
+
+        function addEvent(type, title, payload) {
+            const eventItem = document.createElement('div');
+            eventItem.className = 'event-item ' + type;
+            
+            const now = new Date();
+            const timeStr = now.toLocaleTimeString();
+            
+            eventItem.innerHTML = `
+                <div class="event-header">
+                    <span class="event-type">${type}</span>
+                    <span class="event-time">${timeStr}</span>
+                </div>
+                <div class="event-content">
+                    <strong>${title}</strong>
+                    ${payload && Object.keys(payload).length > 0 ? `<pre>${JSON.stringify(payload, null, 2)}</pre>` : ''}
+                </div>
+            `;
+
+            elements.eventsList.insertBefore(eventItem, elements.eventsList.firstChild);
+            
+            // 只保留最新 50 個事件
+            while (elements.eventsList.children.length > 50) {
+                elements.eventsList.removeChild(elements.eventsList.lastChild);
+            }
+        }
+
+        function formatEventContent(data) {
+            switch (data.event_type) {
+                case 'result':
+                    return '新遊戲結果';
+                case 'error':
+                    return '錯誤: ' + (data.payload.error || '未知錯誤');
+                case 'heartbeat':
+                    return '心跳檢測';
+                case 'started':
+                    return '任務開始: ' + (data.payload.job_name || data.payload.job_id);
+                case 'finished':
+                    return '任務完成: ' + (data.payload.success ? '成功' : '失敗');
+                default:
+                    return data.event_type;
+            }
+        }
+
+        function clearEvents() {
+            elements.eventsList.innerHTML = '';
+        }
+
+        function resetStats() {
+            eventCount = 0;
+            errorCount = 0;
+            eventTimes = [];
+            firstEventTime = null;
+            
+            elements.totalEvents.textContent = '0';
+            elements.errorCount.textContent = '0';
+            elements.ttfdValue.textContent = '--';
+            elements.avgLatency.textContent = '--';
+            elements.eventsPerSecond.textContent = '0';
+            
+            clearEvents();
+        }
+
+        function updateFilter() {
+            if (isConnected) {
+                disconnect();
+                setTimeout(connect, 100);
+            }
+        }
+
+        async function loadMetrics() {
+            try {
+                const response = await fetch('http://127.0.0.1:8000/api/metrics');
+                const data = await response.json();
+                
+                displayMetrics(data);
+            } catch (error) {
+                console.error('載入指標失敗:', error);
+                elements.metricsList.innerHTML = '<div class="metric-item"><span class="metric-label error">載入失敗: ' + error.message + '</span></div>';
+            }
+        }
+
+        function displayMetrics(data) {
+            const metrics = data.metrics || {};
+            const watchdog = data.watchdog || {};
+            const sse = data.sse_server || {};
+            
+            let html = '';
+            
+            // 性能指標
+            if (metrics.performance) {
+                const perf = metrics.performance;
+                html += `<div class="metric-item"><span class="metric-label">TTFD P95</span><span class="metric-value">${perf.ttfd?.p95?.toFixed(1) || 0}ms</span></div>`;
+                html += `<div class="metric-item"><span class="metric-label">E2E P95</span><span class="metric-value">${perf.end_to_end?.p95?.toFixed(1) || 0}ms</span></div>`;
+                html += `<div class="metric-item"><span class="metric-label">成功率</span><span class="metric-value">${(perf.success_rate * 100).toFixed(1)}%</span></div>`;
+            }
+            
+            // Watchdog 狀態
+            html += `<div class="metric-item"><span class="metric-label">Watchdog 健康</span><span class="metric-value ${watchdog.is_healthy ? 'success' : 'error'}">${watchdog.is_healthy ? '正常' : '異常'}</span></div>`;
+            html += `<div class="metric-item"><span class="metric-label">連續失敗</span><span class="metric-value">${watchdog.consecutive_failures || 0}</span></div>`;
+            
+            // SSE 統計
+            html += `<div class="metric-item"><span class="metric-label">活躍連接</span><span class="metric-value">${sse.active_connections || 0}</span></div>`;
+            html += `<div class="metric-item"><span class="metric-label">總連接數</span><span class="metric-value">${sse.total_connections || 0}</span></div>`;
+            
+            // 系統統計
+            if (metrics.counters) {
+                for (const [key, value] of Object.entries(metrics.counters)) {
+                    html += `<div class="metric-item"><span class="metric-label">${key}</span><span class="metric-value">${value}</span></div>`;
+                }
+            }
+            
+            html += `<div class="metric-item"><button class="btn btn-secondary" onclick="loadMetrics()">刷新</button></div>`;
+            
+            elements.metricsList.innerHTML = html;
+        }
+
+        // 初始載入指標
+        setTimeout(loadMetrics, 1000);
+        
+        // 定期更新指標
+        setInterval(loadMetrics, 30000);
+    </script>
+</body>
+</html>
