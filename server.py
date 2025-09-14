@@ -500,9 +500,9 @@ async def get_tables_summary():
             if isinstance(game_result, dict):
                 result_code = game_result.get("result", -1)
                 data["latest_result"] = (
-                    "莊勝" if result_code == 1 else
-                    "閒勝" if result_code == 2 else
-                    "和局" if result_code == 3 else
+                    "閒勝" if result_code == 1 else
+                    "和局" if result_code == 2 else
+                    "莊勝" if result_code == 3 else
                     "取消/無效" if result_code == 0 else
                     "進行中" if result_code == -1 else
                     f"結果{result_code}"
@@ -554,9 +554,9 @@ async def get_table_records(
         if isinstance(game_result, dict):
             result_code = game_result.get("result", -1)
             latest_game_result = (
-                "莊勝" if result_code == 1 else
-                "閒勝" if result_code == 2 else
-                "和局" if result_code == 3 else
+                "閒勝" if result_code == 1 else
+                "和局" if result_code == 2 else
+                "莊勝" if result_code == 3 else
                 "取消/無效" if result_code == 0 else
                 "進行中" if result_code == -1 else
                 f"結果{result_code}"

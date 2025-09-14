@@ -105,6 +105,32 @@
         .table-card-item { margin-bottom: 5px; }
         
         .hidden { display: none; }
+
+        .points-display {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            font-family: 'Courier New', monospace;
+            font-weight: bold;
+        }
+        .banker-points {
+            color: #ef4444;
+            background: rgba(239, 68, 68, 0.1);
+            padding: 2px 6px;
+            border-radius: 4px;
+            border: 1px solid rgba(239, 68, 68, 0.3);
+        }
+        .player-points {
+            color: #60a5fa;
+            background: rgba(96, 165, 250, 0.1);
+            padding: 2px 6px;
+            border-radius: 4px;
+            border: 1px solid rgba(96, 165, 250, 0.3);
+        }
+        .points-separator {
+            color: #666;
+            font-weight: normal;
+        }
     </style>
 </head>
 <body>
@@ -182,12 +208,13 @@
                                 <th>桌號</th>
                                 <th>開局時間</th>
                                 <th>結果</th>
+                                <th>點數 (莊/閒)</th>
                                 <th>狀態</th>
                             </tr>
                         </thead>
                         <tbody id="gameTableBody">
                             <tr>
-                                <td colspan="5" style="text-align: center; color: #888;">等待連接...</td>
+                                <td colspan="6" style="text-align: center; color: #888;">等待連接...</td>
                             </tr>
                         </tbody>
                     </table>
@@ -703,49 +730,52 @@
 
             if (typeof gameResultData === 'object' && [1, 2, 3, 0].includes(gameResultData.result)) {
                 const resultCode = gameResultData.result;
-                if (resultCode === 1) gameResult = '莊勝';
-                else if (resultCode === 2) gameResult = '閒勝';
-                else if (resultCode === 3) gameResult = '和局';
+                if (resultCode === 1) gameResult = '閒勝';
+                else if (resultCode === 2) gameResult = '和局';
+                else if (resultCode === 3) gameResult = '莊勝';
                 else if (resultCode === 0) gameResult = '取消/無效';
             } else if (/(派彩|已彩|結束|finished)/i.test(status)) {
                 gameResult = '已派彩'; // 狀態 fallback：若沒有具體結果但狀態顯示已結束
             }
 
-            // 如果當前是篩選特定桌號，且該結果不屬於當前桌號，則不顯示
-            if (currentTableId && tableId !== currentTableId) {
-                return;
-            }
-
-            const newRecord = {
+            const payload = {
                 roundId,
                 tableId,
                 startTime,
-                gameResult,
-                status: status || '未知',
-                timestamp: Date.now()
+                result: gameResult,
+                resultCode: gameResultData.result || -1,
+                status,
+                raw: result
             };
 
-            // Enhanced upsert logic using Map for better performance
-            const upsertKey = `${tableId}:${roundId}`;
-
-            // Remove any existing record with the same key
-            gameResults = gameResults.filter(r =>
-                !(r.tableId === tableId && r.roundId === roundId)
+            const idx = gameResults.findIndex(
+                r => String(r.tableId) === String(tableId) && String(r.roundId) === String(roundId)
             );
-
-            // Add the new/updated record at the beginning
-            gameResults.unshift(newRecord);
-
-            // Keep only the latest 30 records after sorting by round_id
-            gameResults.sort((a, b) => {
-                const aRound = parseInt(a.roundId) || 0;
-                const bRound = parseInt(b.roundId) || 0;
-                return bRound - aRound; // Descending order
-            });
-
-            if (gameResults.length > 30) {
-                gameResults = gameResults.slice(0, 30);
+            if (idx >= 0) {
+                // 更新舊資料（例如把「進行中」更新成「已派彩／莊勝」）
+                gameResults[idx] = {
+                    roundId,
+                    tableId,
+                    startTime,
+                    gameResult,
+                    status: status || '未知',
+                    timestamp: Date.now(),
+                    raw: result  // Include raw data for points extraction
+                };
+            } else {
+                // 新資料才塞到陣列最前面
+                gameResults.unshift({
+                    roundId,
+                    tableId,
+                    startTime,
+                    gameResult,
+                    status: status || '未知',
+                    timestamp: Date.now(),
+                    raw: result  // Include raw data for points extraction
+                });
             }
+
+            if (gameResults.length > 100) gameResults = gameResults.slice(0, 100);
         }
 
         function updateGameTable() {
@@ -755,19 +785,20 @@
             if (gameResults.length === 0) {
                 const row = tbody.insertRow();
                 const cell = row.insertCell(0);
-                cell.colSpan = 5;
+                cell.colSpan = 6;
                 cell.style.textAlign = 'center';
                 cell.style.color = '#888';
                 cell.textContent = currentTableId ? `${currentTableId} 桌暫無遊戲結果` : '暫無遊戲結果';
                 return;
             }
 
-            // Sort by round_id (integer) in descending order before displaying
-            const sortedResults = [...gameResults].sort((a, b) => {
-                const aRound = parseInt(a.roundId) || 0;
-                const bRound = parseInt(b.roundId) || 0;
-                return bRound - aRound; // Descending order
-            });
+            const filtered = gameResults.filter(r => !currentTableId || String(r.tableId) === String(currentTableId));
+
+            // 依「局號」由大到小（最新在前），保證同桌內排序正確
+            filtered.sort((a, b) => (Number(b.roundId) || 0) - (Number(a.roundId) || 0));
+
+            const limited = filtered.slice(0, 30);
+            const sortedResults = limited;
 
             sortedResults.forEach((result, index) => {
                 const row = tbody.insertRow();
@@ -786,7 +817,61 @@
                 row.insertCell(2).textContent = formatTime(result.startTime);
                 row.insertCell(3).textContent = result.gameResult;
 
-                const statusCell = row.insertCell(4);
+                // 新增點數欄位
+                const pointsCell = row.insertCell(4);
+                let bankerPoints = null;
+                let playerPoints = null;
+
+                // Debug: log the data structure
+                console.debug('[POINTS DEBUG]', 'result object:', result);
+                console.debug('[POINTS DEBUG]', 'raw object:', result.raw);
+
+                // 嘗試從多個位置提取點數信息
+                if (result.raw) {
+                    // 方法1: 直接在 raw 對象中查找 (測試數據格式)
+                    if (result.raw.bankerPoints !== undefined && result.raw.playerPoints !== undefined) {
+                        bankerPoints = result.raw.bankerPoints;
+                        playerPoints = result.raw.playerPoints;
+                    }
+                    // 方法2: 在 gameResult 對象中查找 (測試數據格式)
+                    else if (result.raw.gameResult && typeof result.raw.gameResult === 'object') {
+                        const gr = result.raw.gameResult;
+                        if (gr.bankerPoints !== undefined && gr.playerPoints !== undefined) {
+                            bankerPoints = gr.bankerPoints;
+                            playerPoints = gr.playerPoints;
+                        }
+                        // 方法3: 真實數據格式 - player_point/banker_point
+                        else if (gr.player_point !== undefined && gr.banker_point !== undefined &&
+                                 gr.player_point !== "" && gr.banker_point !== "" &&
+                                 gr.player_point !== "-" && gr.banker_point !== "-") {
+                            playerPoints = gr.player_point;
+                            bankerPoints = gr.banker_point;
+                        }
+                        // 方法4: 真實數據格式 - maximum_points
+                        else if (gr.player_maximum_points !== undefined && gr.banker_maximum_points !== undefined &&
+                                 gr.player_maximum_points !== "" && gr.banker_maximum_points !== "" &&
+                                 gr.player_maximum_points !== "-" && gr.banker_maximum_points !== "-") {
+                            playerPoints = gr.player_maximum_points;
+                            bankerPoints = gr.banker_maximum_points;
+                        }
+                    }
+                }
+
+                if (bankerPoints !== null && playerPoints !== null) {
+                    pointsCell.innerHTML = `
+                        <div class="points-display">
+                            <span class="banker-points">${bankerPoints}</span>
+                            <span class="points-separator">/</span>
+                            <span class="player-points">${playerPoints}</span>
+                        </div>
+                    `;
+                } else {
+                    pointsCell.textContent = '等待點數';
+                    pointsCell.style.color = '#888';
+                    pointsCell.style.fontSize = '0.85rem';
+                }
+
+                const statusCell = row.insertCell(5);
                 const statusBadge = document.createElement('span');
                 statusBadge.className = 'badge ' + getStatusBadgeClass(result.status);
                 statusBadge.textContent = result.status;
