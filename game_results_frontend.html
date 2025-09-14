@@ -3,11 +3,11 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>T9 遊戲結果即時監控</title>
+    <title>T9 遊戲結果即時監控 - 分桌顯示</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #1a1a1a; color: #fff; }
-        .container { max-width: 1600px; margin: 0 auto; padding: 20px; }
+        .container { max-width: 1800px; margin: 0 auto; padding: 20px; }
         .header { text-align: center; margin-bottom: 30px; }
         .title { font-size: 2.5rem; font-weight: 600; margin-bottom: 10px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
         .subtitle { color: #888; font-size: 1.1rem; }
@@ -24,18 +24,45 @@
         .btn-primary:hover { background: #5a6fd8; }
         .btn-secondary { background: #6b7280; color: white; }
         .btn-secondary:hover { background: #5f656d; }
+        .btn-small { padding: 4px 8px; font-size: 0.8rem; }
         
-        .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 30px; }
+        .controls { display: flex; align-items: center; gap: 15px; margin-bottom: 20px; }
+        .table-selector { display: flex; align-items: center; gap: 10px; }
+        .table-selector select { 
+            padding: 8px 12px; 
+            border: 1px solid #444; 
+            border-radius: 6px; 
+            background: #2a2a2a; 
+            color: #fff; 
+            min-width: 200px;
+        }
+        .table-tabs { display: flex; gap: 5px; flex-wrap: wrap; margin-bottom: 20px; }
+        .table-tab { 
+            padding: 8px 16px; 
+            border: 1px solid #444; 
+            border-radius: 6px; 
+            background: #2a2a2a; 
+            color: #fff; 
+            cursor: pointer; 
+            transition: all 0.2s;
+            font-size: 0.9rem;
+        }
+        .table-tab:hover { background: #3a3a3a; }
+        .table-tab.active { background: #667eea; border-color: #667eea; }
+        .table-tab.has-activity { border-left: 4px solid #4ade80; }
+        
+        .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 15px; margin-bottom: 30px; }
         .stat-card { background: #2a2a2a; border: 1px solid #333; border-radius: 8px; padding: 15px; }
         .stat-title { font-size: 0.9rem; color: #888; margin-bottom: 5px; }
         .stat-value { font-size: 1.5rem; font-weight: 600; }
         .stat-value.success { color: #4ade80; }
         .stat-value.warning { color: #fbbf24; }
         .stat-value.error { color: #ef4444; }
+        .stat-value.info { color: #60a5fa; }
         
         .main-content { display: grid; grid-template-columns: 1fr 400px; gap: 20px; height: 70vh; }
         .panel { background: #2a2a2a; border: 1px solid #333; border-radius: 8px; overflow: hidden; }
-        .panel-header { background: #333; padding: 15px; font-weight: 600; border-bottom: 1px solid #444; }
+        .panel-header { background: #333; padding: 15px; font-weight: 600; border-bottom: 1px solid #444; display: flex; justify-content: space-between; align-items: center; }
         .panel-content { height: calc(100% - 60px); overflow-y: auto; padding: 15px; }
         
         .game-table { width: 100%; }
@@ -43,6 +70,8 @@
         .game-table th { background: #333; color: #aaa; font-size: 0.9rem; }
         .game-table tr:nth-child(even) { background: #1a1a1a; }
         .game-table tr.fresh { background: #0d4f3c; animation: fadeIn 0.5s ease-in; }
+        .game-table tr.in-progress { background: #1a2e3a; }
+        .game-table tr.betting { background: #3a2a1a; }
         
         @keyframes fadeIn { from { opacity: 0; background: #1a472a; } to { opacity: 1; background: #0d4f3c; } }
         
@@ -62,13 +91,27 @@
         .badge-danger { background: #7f1d1d; color: #fca5a5; }
         .badge-warning { background: #92400e; color: #fbbf24; }
         .badge-info { background: #1e3a8a; color: #93c5fd; }
+        .badge-betting { background: #92400e; color: #fed7aa; }
+        .badge-in-progress { background: #065f46; color: #6ee7b7; }
+        
+        .table-overview { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 15px; margin-bottom: 20px; }
+        .table-card { background: #2a2a2a; border: 1px solid #333; border-radius: 8px; padding: 15px; cursor: pointer; transition: all 0.2s; }
+        .table-card:hover { background: #3a3a3a; transform: translateY(-2px); }
+        .table-card.active { border-color: #667eea; background: #2a2e3a; }
+        .table-card-header { display: flex; justify-content: between; align-items: center; margin-bottom: 10px; }
+        .table-card-title { font-size: 1.1rem; font-weight: 600; color: #667eea; }
+        .table-card-status { font-size: 0.8rem; padding: 2px 6px; border-radius: 4px; }
+        .table-card-content { font-size: 0.9rem; }
+        .table-card-item { margin-bottom: 5px; }
+        
+        .hidden { display: none; }
     </style>
 </head>
 <body>
     <div class="container">
         <header class="header">
             <h1 class="title">T9 遊戲結果即時監控</h1>
-            <p class="subtitle">基於 SSE 的零延遲遊戲結果監控系統</p>
+            <p class="subtitle">基於 SSE 的零延遲遊戲結果監控系統 - 分桌顯示</p>
         </header>
 
         <div class="connection-status">
@@ -77,7 +120,26 @@
             <button class="btn btn-primary" id="connectBtn" onclick="toggleConnection()">連接</button>
             <button class="btn btn-secondary" onclick="clearResults()">清空結果</button>
             <button class="btn btn-secondary" onclick="resetStats()">重置統計</button>
+            <button class="btn btn-secondary" onclick="refreshTables()">刷新桌號</button>
         </div>
+
+        <div class="controls">
+            <div class="table-selector">
+                <label for="tableSelect">選擇桌號:</label>
+                <select id="tableSelect" onchange="switchTable()">
+                    <option value="">載入中...</option>
+                </select>
+            </div>
+            <button class="btn btn-secondary btn-small" onclick="toggleOverview()">
+                <span id="overviewToggleText">總覽模式</span>
+            </button>
+        </div>
+
+        <!-- 桌號標籤 -->
+        <div class="table-tabs" id="tableTabs"></div>
+
+        <!-- 總覽模式 -->
+        <div class="table-overview hidden" id="tableOverview"></div>
 
         <div class="stats">
             <div class="stat-card">
@@ -85,16 +147,16 @@
                 <div class="stat-value" id="connectionTime">--</div>
             </div>
             <div class="stat-card">
+                <div class="stat-title">當前桌號</div>
+                <div class="stat-value info" id="currentTable">全部</div>
+            </div>
+            <div class="stat-card">
                 <div class="stat-title">接收結果</div>
                 <div class="stat-value success" id="totalResults">0</div>
             </div>
             <div class="stat-card">
-                <div class="stat-title">TTFD (首筆)</div>
-                <div class="stat-value" id="ttfdValue">--</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-title">結果/分鐘</div>
-                <div class="stat-value" id="resultsPerMinute">0</div>
+                <div class="stat-title">活躍桌數</div>
+                <div class="stat-value" id="activeTables">0</div>
             </div>
             <div class="stat-card">
                 <div class="stat-title">最後更新</div>
@@ -106,9 +168,12 @@
             </div>
         </div>
 
-        <div class="main-content">
+        <div class="main-content" id="detailView">
             <div class="panel">
-                <div class="panel-header">遊戲結果 (最新 100 筆)</div>
+                <div class="panel-header">
+                    <span id="panelTitle">遊戲結果 (最新 30 筆)</span>
+                    <button class="btn btn-secondary btn-small" onclick="refreshCurrentTable()">刷新</button>
+                </div>
                 <div class="panel-content">
                     <table class="game-table" id="gameTable">
                         <thead>
@@ -146,6 +211,17 @@
         let errorCount = 0;
         let gameResults = [];
         let resultTimes = [];
+        let availableTables = [];
+        let currentTableId = '';
+        let isOverviewMode = false;
+        let refreshInterval = null;
+        let refreshTimeoutId = null;
+        let consecutiveErrors = 0;
+        let isPageStuck = false;
+        let lastActivityTime = Date.now();
+
+        // Frontend store and deduplication
+        const recordStore = new Map(); // key: tableId:roundId, value: { phase, hash, record }
 
         const elements = {
             status: document.getElementById('connectionStatus'),
@@ -154,12 +230,313 @@
             eventsList: document.getElementById('eventsList'),
             gameTableBody: document.getElementById('gameTableBody'),
             totalResults: document.getElementById('totalResults'),
-            ttfdValue: document.getElementById('ttfdValue'),
-            resultsPerMinute: document.getElementById('resultsPerMinute'),
             lastUpdate: document.getElementById('lastUpdate'),
             errorCount: document.getElementById('errorCount'),
-            connectionTime: document.getElementById('connectionTime')
+            connectionTime: document.getElementById('connectionTime'),
+            currentTable: document.getElementById('currentTable'),
+            activeTables: document.getElementById('activeTables'),
+            tableSelect: document.getElementById('tableSelect'),
+            tableTabs: document.getElementById('tableTabs'),
+            tableOverview: document.getElementById('tableOverview'),
+            detailView: document.getElementById('detailView'),
+            panelTitle: document.getElementById('panelTitle'),
+            overviewToggleText: document.getElementById('overviewToggleText')
         };
+
+        // Phase classification function (matches server-side logic)
+        function phaseOf(record) {
+            const gameResult = record.gameResult || {};
+            const result = (typeof gameResult === 'object' && gameResult.result !== undefined) ? gameResult.result : -1;
+            const status = (record.game_payment_status_name || "").trim();
+
+            if ([1, 2, 3].includes(result)) {
+                return 3;
+            }
+            if (['停止', '派彩', '結束'].some(keyword => status.includes(keyword))) {
+                return 2;
+            }
+            return 1;
+        }
+
+        // Primary key function for upsert logic
+        function getPrimaryKey(record) {
+            const tableId = record.table_id || record.tableId || record.table;
+            const roundId = record.round_id || record.roundId;
+
+            if (tableId && roundId) {
+                return `${tableId}:${parseInt(roundId)}`;
+            }
+            return null;
+        }
+
+        // Apply record with upsert logic
+        function applyRecord(record) {
+            const primaryKey = getPrimaryKey(record);
+
+            if (!primaryKey) {
+                // No primary key, add directly (fallback)
+                addGameResultFromData(record);
+                return true;
+            }
+
+            const phase = phaseOf(record);
+            const existing = recordStore.get(primaryKey);
+
+            if (!existing) {
+                // New record
+                recordStore.set(primaryKey, { phase, record });
+                addGameResultFromData(record);
+                return true;
+            } else {
+                // Update existing record (upsert logic)
+                // Allow phase progression or same phase with different content
+                if (phase >= existing.phase) {
+                    recordStore.set(primaryKey, {
+                        phase: Math.max(phase, existing.phase),
+                        record
+                    });
+                    addGameResultFromData(record);
+                    return true;
+                }
+
+                // Phase regression - ignore but log
+                console.debug(`[UPSERT] Phase regression ignored: ${primaryKey} (${phase} < ${existing.phase})`);
+                return false;
+            }
+        }
+
+        // Smart refresh with throttling and backoff
+        function scheduleNextRefresh() {
+            if (refreshTimeoutId) {
+                clearTimeout(refreshTimeoutId);
+            }
+
+            let delay;
+            if (consecutiveErrors === 0) {
+                // Normal case: 6-9 seconds random
+                delay = 6000 + Math.random() * 3000;
+            } else {
+                // Backoff case: 15-20 seconds random
+                delay = 15000 + Math.random() * 5000;
+            }
+
+            refreshTimeoutId = setTimeout(async () => {
+                try {
+                    await softRefresh();
+                    consecutiveErrors = 0; // Reset on success
+                    scheduleNextRefresh();
+                } catch (error) {
+                    consecutiveErrors++;
+                    console.error('Soft refresh failed:', error);
+
+                    // Check if page is stuck
+                    const now = Date.now();
+                    if (now - lastActivityTime > 60000) { // 1 minute of inactivity
+                        console.warn('Page appears stuck, triggering reload');
+                        window.location.reload();
+                    } else {
+                        scheduleNextRefresh();
+                    }
+                }
+            }, delay);
+        }
+
+        // Soft refresh function
+        async function softRefresh() {
+            const response = await fetch('http://127.0.0.1:8000/api/latest?limit=30');
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+            }
+
+            const data = await response.json();
+            const records = data.records || [];
+
+            let newCount = 0;
+            records.forEach(record => {
+                if (applyRecord(record)) {
+                    newCount++;
+                }
+            });
+
+            if (newCount > 0) {
+                lastActivityTime = Date.now();
+                updateGameTable();
+            }
+
+            return newCount;
+        }
+
+        async function fetchTables() {
+            try {
+                const response = await fetch('http://127.0.0.1:8000/api/tables/summary');
+                const data = await response.json();
+                availableTables = data.tables || [];
+                updateTableSelector();
+                updateTableTabs();
+                updateOverview();
+                elements.activeTables.textContent = data.total_tables || 0;
+            } catch (error) {
+                console.error('獲取桌號失敗:', error);
+                addEvent('error', '獲取桌號失敗', { error: error.message });
+            }
+        }
+
+        function updateTableSelector() {
+            const select = elements.tableSelect;
+            select.innerHTML = '<option value="">全部桌號</option>';
+            
+            availableTables.forEach(table => {
+                const option = document.createElement('option');
+                option.value = table.table_id;
+                option.textContent = `${table.table_id} (${table.current_status})`;
+                select.appendChild(option);
+            });
+            
+            if (currentTableId) {
+                select.value = currentTableId;
+            }
+        }
+
+        function updateTableTabs() {
+            const tabsContainer = elements.tableTabs;
+            tabsContainer.innerHTML = '';
+            
+            // 全部標籤
+            const allTab = document.createElement('div');
+            allTab.className = `table-tab ${currentTableId === '' ? 'active' : ''}`;
+            allTab.textContent = '全部';
+            allTab.onclick = () => switchToTable('');
+            tabsContainer.appendChild(allTab);
+            
+            // 各桌標籤
+            availableTables.forEach(table => {
+                const tab = document.createElement('div');
+                tab.className = `table-tab ${currentTableId === table.table_id ? 'active' : ''}`;
+                if (table.current_status === '投注中' || table.current_status === '開獎中') {
+                    tab.classList.add('has-activity');
+                }
+                tab.innerHTML = `
+                    <div>${table.table_id}</div>
+                    <div style="font-size: 0.7rem; color: #888;">${table.current_status}</div>
+                `;
+                tab.onclick = () => switchToTable(table.table_id);
+                tabsContainer.appendChild(tab);
+            });
+        }
+
+        function updateOverview() {
+            const container = elements.tableOverview;
+            container.innerHTML = '';
+            
+            availableTables.forEach(table => {
+                const card = document.createElement('div');
+                card.className = 'table-card';
+                card.onclick = () => {
+                    toggleOverview();
+                    switchToTable(table.table_id);
+                };
+                
+                const statusClass = getStatusBadgeClass(table.current_status);
+                
+                card.innerHTML = `
+                    <div class="table-card-header">
+                        <div class="table-card-title">${table.table_id}</div>
+                        <span class="badge ${statusClass}">${table.current_status}</span>
+                    </div>
+                    <div class="table-card-content">
+                        <div class="table-card-item"><strong>最新結果:</strong> ${table.latest_result}</div>
+                        <div class="table-card-item"><strong>最新局號:</strong> ${table.latest_round_id}</div>
+                        <div class="table-card-item"><strong>總局數:</strong> ${table.total_games}</div>
+                        <div class="table-card-item"><strong>開局時間:</strong> ${formatTime(table.game_start_time)}</div>
+                    </div>
+                `;
+                
+                container.appendChild(card);
+            });
+        }
+
+        function switchTable() {
+            const selectedTable = elements.tableSelect.value;
+            switchToTable(selectedTable);
+        }
+
+        function switchToTable(tableId) {
+            currentTableId = tableId;
+            elements.currentTable.textContent = tableId || '全部';
+            elements.tableSelect.value = tableId;
+            
+            // 更新標籤狀態
+            document.querySelectorAll('.table-tab').forEach(tab => {
+                tab.classList.remove('active');
+            });
+            
+            if (tableId === '') {
+                document.querySelector('.table-tab:first-child').classList.add('active');
+                elements.panelTitle.textContent = '遊戲結果 - 全部桌號 (最新 30 筆)';
+            } else {
+                const activeTab = Array.from(document.querySelectorAll('.table-tab')).find(tab =>
+                    tab.textContent.includes(tableId)
+                );
+                if (activeTab) activeTab.classList.add('active');
+                elements.panelTitle.textContent = `遊戲結果 - ${tableId} (最新 30 筆)`;
+            }
+            
+            refreshCurrentTable();
+        }
+
+        async function refreshCurrentTable() {
+            try {
+                let url;
+                if (currentTableId) {
+                    url = `http://127.0.0.1:8000/api/tables/${currentTableId}?limit=30`;
+                } else {
+                    url = 'http://127.0.0.1:8000/api/latest?limit=30';
+                }
+
+                const response = await fetch(url);
+                const data = await response.json();
+
+                gameResults = [];
+                recordStore.clear(); // Clear store for full refresh
+                const records = data.records || [];
+
+                records.forEach(record => {
+                    applyRecord(record);
+                });
+
+                updateGameTable();
+                addEvent('system', `刷新${currentTableId || '全部'}桌號數據`, {
+                    table: currentTableId || '全部',
+                    count: records.length
+                });
+
+                lastActivityTime = Date.now();
+
+            } catch (error) {
+                console.error('刷新數據失敗:', error);
+                addEvent('error', '刷新數據失敗', { error: error.message });
+                consecutiveErrors++;
+            }
+        }
+
+        function toggleOverview() {
+            isOverviewMode = !isOverviewMode;
+            if (isOverviewMode) {
+                elements.tableOverview.classList.remove('hidden');
+                elements.detailView.classList.add('hidden');
+                elements.overviewToggleText.textContent = '詳細模式';
+                updateOverview();
+            } else {
+                elements.tableOverview.classList.add('hidden');
+                elements.detailView.classList.remove('hidden');
+                elements.overviewToggleText.textContent = '總覽模式';
+            }
+        }
+
+        function refreshTables() {
+            fetchTables();
+            addEvent('system', '手動刷新桌號列表', {});
+        }
 
         function toggleConnection() {
             if (isConnected) {
@@ -191,6 +568,10 @@
                 elements.connectionTime.textContent = connectTime + 'ms';
                 
                 addEvent('system', '連接建立', { url: url, connectTime: connectTime });
+                
+                // 開始智能刷新
+                scheduleNextRefresh(); // 開始智能刷新調度
+                fetchTables(); // 立即獲取一次
             };
 
             eventSource.addEventListener('result', function(event) {
@@ -250,6 +631,11 @@
                 eventSource = null;
             }
             
+            if (refreshTimeoutId) {
+                clearTimeout(refreshTimeoutId);
+                refreshTimeoutId = null;
+            }
+            
             isConnected = false;
             elements.status.className = 'status-indicator';
             elements.text.textContent = '已斷開';
@@ -262,41 +648,26 @@
             resultCount++;
             elements.totalResults.textContent = resultCount;
 
-            // 記錄 TTFD
-            if (!firstResultTime) {
-                firstResultTime = Date.now();
-                const ttfd = firstResultTime - connectionStartTime;
-                elements.ttfdValue.textContent = ttfd + 'ms';
-                elements.ttfdValue.className = 'stat-value ' + (ttfd <= 300 ? 'success' : ttfd <= 800 ? 'warning' : 'error');
-            }
-
-            // 更新速率統計
-            const now = Date.now();
-            resultTimes.push(now);
-            if (resultTimes.length > 100) resultTimes.shift(); // 只保留最近 100 個
-            
-            if (resultTimes.length > 1) {
-                const timeSpan = (resultTimes[resultTimes.length - 1] - resultTimes[0]) / 1000;
-                const rate = (resultTimes.length - 1) / timeSpan * 60; // 每分鐘
-                elements.resultsPerMinute.textContent = rate.toFixed(1);
-            }
-
             // 更新最後時間
             elements.lastUpdate.textContent = new Date().toLocaleTimeString();
 
             // 處理遊戲結果數據
-            if (data.payload && data.payload.results) {
+            if (data.payload && data.payload.record) {
+                addGameResultFromSSE(data.payload.record);
+            } else if (data.payload && data.payload.results) {
                 for (const result of data.payload.results) {
-                    addGameResult(result);
+                    addGameResultFromSSE(result);
                 }
             } else if (data.payload) {
-                addGameResult(data.payload);
+                addGameResultFromSSE(data.payload);
             }
 
-            addEvent('result', `收到 ${data.payload?.results?.length || 1} 筆遊戲結果`, {
-                count: data.payload?.results?.length || 1,
+            addEvent('result', `收到遊戲結果`, {
                 latency: data.latency_ms || 'N/A'
             });
+
+            // 刷新桌號列表（如果有新桌號）
+            setTimeout(fetchTables, 1000);
         }
 
         function handleError(data) {
@@ -312,29 +683,69 @@
             });
         }
 
-        function addGameResult(result) {
+        function addGameResultFromSSE(result) {
+            // Use the new applyRecord function for deduplication
+            if (applyRecord(result)) {
+                lastActivityTime = Date.now();
+                updateGameTable();
+            }
+        }
+
+        function addGameResultFromData(result) {
             const roundId = result.round_id || result.roundId || result.id || 'N/A';
             const tableId = result.table_id || result.tableId || result.table || 'N/A';
             const startTime = result.game_start_time || result.openTime || result.start_time || 'N/A';
-            const gameResult = result.result || result.outcome || 'N/A';
-            const status = result.status || (result.finished ? '已結束' : '進行中');
 
-            // 添加到結果列表
-            gameResults.unshift({
+            // 處理遊戲結果
+            let gameResult = '進行中';
+            const gameResultData = result.gameResult || {};
+            const status = (result.game_payment_status_name || '').trim();
+
+            if (typeof gameResultData === 'object' && [1, 2, 3, 0].includes(gameResultData.result)) {
+                const resultCode = gameResultData.result;
+                if (resultCode === 1) gameResult = '莊勝';
+                else if (resultCode === 2) gameResult = '閒勝';
+                else if (resultCode === 3) gameResult = '和局';
+                else if (resultCode === 0) gameResult = '取消/無效';
+            } else if (/(派彩|已彩|結束|finished)/i.test(status)) {
+                gameResult = '已派彩'; // 狀態 fallback：若沒有具體結果但狀態顯示已結束
+            }
+
+            // 如果當前是篩選特定桌號，且該結果不屬於當前桌號，則不顯示
+            if (currentTableId && tableId !== currentTableId) {
+                return;
+            }
+
+            const newRecord = {
                 roundId,
                 tableId,
                 startTime,
                 gameResult,
-                status,
+                status: status || '未知',
                 timestamp: Date.now()
+            };
+
+            // Enhanced upsert logic using Map for better performance
+            const upsertKey = `${tableId}:${roundId}`;
+
+            // Remove any existing record with the same key
+            gameResults = gameResults.filter(r =>
+                !(r.tableId === tableId && r.roundId === roundId)
+            );
+
+            // Add the new/updated record at the beginning
+            gameResults.unshift(newRecord);
+
+            // Keep only the latest 30 records after sorting by round_id
+            gameResults.sort((a, b) => {
+                const aRound = parseInt(a.roundId) || 0;
+                const bRound = parseInt(b.roundId) || 0;
+                return bRound - aRound; // Descending order
             });
 
-            // 只保留最新 100 筆
-            if (gameResults.length > 100) {
-                gameResults = gameResults.slice(0, 100);
+            if (gameResults.length > 30) {
+                gameResults = gameResults.slice(0, 30);
             }
-
-            updateGameTable();
         }
 
         function updateGameTable() {
@@ -347,19 +758,34 @@
                 cell.colSpan = 5;
                 cell.style.textAlign = 'center';
                 cell.style.color = '#888';
-                cell.textContent = '暫無遊戲結果';
+                cell.textContent = currentTableId ? `${currentTableId} 桌暫無遊戲結果` : '暫無遊戲結果';
                 return;
             }
 
-            gameResults.forEach((result, index) => {
+            // Sort by round_id (integer) in descending order before displaying
+            const sortedResults = [...gameResults].sort((a, b) => {
+                const aRound = parseInt(a.roundId) || 0;
+                const bRound = parseInt(b.roundId) || 0;
+                return bRound - aRound; // Descending order
+            });
+
+            sortedResults.forEach((result, index) => {
                 const row = tbody.insertRow();
-                if (index < 5) row.className = 'fresh'; // 最新 5 筆標記為新增
+
+                // 根據狀態添加不同的樣式
+                if (result.status === '投注中') {
+                    row.className = 'betting';
+                } else if (result.status === '開獎中' || result.gameResult === '進行中') {
+                    row.className = 'in-progress';
+                } else if (index < 5) {
+                    row.className = 'fresh'; // 最新 5 筆標記為新增
+                }
 
                 row.insertCell(0).textContent = result.roundId;
                 row.insertCell(1).textContent = result.tableId;
                 row.insertCell(2).textContent = formatTime(result.startTime);
                 row.insertCell(3).textContent = result.gameResult;
-                
+
                 const statusCell = row.insertCell(4);
                 const statusBadge = document.createElement('span');
                 statusBadge.className = 'badge ' + getStatusBadgeClass(result.status);
@@ -383,7 +809,8 @@
 
         function getStatusBadgeClass(status) {
             if (status === '已結束' || status === 'finished') return 'badge-success';
-            if (status === '進行中' || status === 'running') return 'badge-info';
+            if (status === '投注中') return 'badge-betting';
+            if (status === '開獎中' || status === '進行中' || status === 'running') return 'badge-in-progress';
             if (status === '錯誤' || status === 'error') return 'badge-danger';
             return 'badge-warning';
         }
@@ -429,8 +856,6 @@
             
             elements.totalResults.textContent = '0';
             elements.errorCount.textContent = '0';
-            elements.ttfdValue.textContent = '--';
-            elements.resultsPerMinute.textContent = '0';
             elements.lastUpdate.textContent = '--';
             
             updateGameTable();

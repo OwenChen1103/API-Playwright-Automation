@@ -13,7 +13,9 @@ import time
 import datetime
 import logging
 import random
+import re
 from typing import Optional, Dict, Any, List
+from collections import deque
 
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright
@@ -33,7 +35,17 @@ INGEST_URL = os.getenv("INGEST_URL", "http://127.0.0.1:8000/ingest")
 INGEST_KEY = os.getenv("INGEST_KEY", "baccaratt9webapi")
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL_SEC", "5.0"))
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "20"))
+LOOKBACK_MINUTES = int(os.getenv("LOOKBACK_MINUTES", "2"))
 ACTIVE_PULL = False  # 先關掉主動 make_api_request
+
+# === 新增滑動帶回填參數 ===
+SCAN_ALL_ROWS = int(os.getenv("SCAN_ALL_ROWS", "100"))      # 掃描第一頁全部100筆
+SEARCH_BAND = int(os.getenv("SEARCH_BAND", "60"))           # 搜索帶寬：前60名
+SOFT_REFRESH_SEC = float(os.getenv("SOFT_REFRESH_SEC", "7.0"))  # 軟刷新間隔
+UPGRADE_TIME_SEC = float(os.getenv("UPGRADE_TIME_SEC", "90.0"))  # 90秒後升級精準搜尋
+UPGRADE_ATTEMPTS = int(os.getenv("UPGRADE_ATTEMPTS", "8"))   # 8次找不到後升級
+ZOMBIE_TIME_SEC = float(os.getenv("ZOMBIE_TIME_SEC", "600.0"))  # 10分鐘僵屍線
+PRECISE_WORKER_INTERVAL = float(os.getenv("PRECISE_WORKER_INTERVAL", "1.2"))  # 精準搜尋節流
 
 class ExistingBrowserMonitor:
     """连接现有浏览器的监控器"""
@@ -53,8 +65,184 @@ class ExistingBrowserMonitor:
             "records_processed": 0
         }
         
+        # 去重機制
+        self._seen_set = set()
+        self._seen_keys = deque(maxlen=1000)  # 最多保留 1000 個 key，避免記憶體無限增長
+
+        # === 新增滑動帶回填機制 ===
+        from collections import defaultdict
+        self.pending = defaultdict(dict)  # {table: {round_id: metadata}}
+        # metadata: {"first_seen_ts", "last_seen_ts", "last_index", "attempts", "status", "stale"}
+        self.precise_queue = []  # 需要精準搜尋的隊列
+        self.current_scan_results = {}  # 當前掃描結果: {round_id: {"index", "status", "result", "table"}}
+
+        # 防抖機制
+        self.last_first_round = None
+        self.skip_count = 0
+
         logger.info("Existing Browser Monitor initialized")
     
+    def _uniq_key(self, record: Dict[str, Any]) -> Optional[str]:
+        """產生記錄的唯一鍵 - 使用 table:round_id 作為主鍵"""
+        table_id = record.get("table_id") or record.get("tableId") or record.get("table")
+        round_id = record.get("round_id") or record.get("roundId") or record.get("merchant_round_id") or record.get("id")
+
+        if table_id and round_id:
+            return f"{table_id}:{round_id}"
+        
+        # 備案：table + start_time（如果沒有 round_id）
+        start_time = (record.get("game_start_time") or record.get("openTime") or
+                     record.get("start_time") or record.get("開局時間"))
+
+        if table_id and start_time:
+            return f"{table_id}@{start_time}"
+        return None
+
+    def _dedupe_new(self, records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """去重並返回新記錄"""
+        out = []
+        for r in records:
+            k = self._uniq_key(r)
+            if not k:
+                continue
+            if k in self._seen_set:
+                continue
+            out.append(r)
+            self._seen_set.add(k)
+            self._seen_keys.append(k)
+            # 當 deque 滿時自然會丟掉最舊的，但 set 還留著；
+            # 簡單處理：當長度差太大時重建一次（偶爾執行即可）
+            if len(self._seen_set) > len(self._seen_keys) + 500:
+                self._seen_set = set(self._seen_keys)
+        return out
+
+    def track_pending_record(self, table: str, round_id: str, status: str, index: int):
+        """追蹤未結束的牌局到滑動帶佇列"""
+        try:
+            now = time.time()
+            is_pending_status = any(keyword in status for keyword in ["投注中", "停止", "進行中"])
+
+            if is_pending_status:
+                if round_id not in self.pending[table]:
+                    # 新的待回填項目
+                    self.pending[table][round_id] = {
+                        "first_seen_ts": now,
+                        "last_seen_ts": now,
+                        "last_index": index,
+                        "attempts": 0,
+                        "status": status,
+                        "stale": False
+                    }
+                    logger.debug(f"[SLIDING] Added to pending: {table}:{round_id} at index {index} ({status})")
+                else:
+                    # 更新現有項目
+                    self.pending[table][round_id].update({
+                        "last_seen_ts": now,
+                        "last_index": index,
+                        "status": status
+                    })
+            else:
+                # 已結束的牌局從待回填中移除
+                if round_id in self.pending[table]:
+                    del self.pending[table][round_id]
+                    logger.debug(f"[SLIDING] Removed from pending: {table}:{round_id} (completed: {status})")
+
+        except Exception as e:
+            logger.debug(f"Track pending error: {e}")
+
+    def update_scan_results(self, records: List[Dict[str, Any]]):
+        """更新當前掃描結果"""
+        self.current_scan_results.clear()
+
+        for index, record in enumerate(records):
+            round_id = str(record.get("round_id") or record.get("roundId") or "")
+            if round_id:
+                table_id = (record.get("table_id") or record.get("tableId") or
+                           record.get("table") or str(record.get("台號", "")))
+                status = record.get("game_payment_status_name", "")
+                game_result = record.get("gameResult", {})
+                result = game_result.get("result", -1) if isinstance(game_result, dict) else -1
+
+                self.current_scan_results[round_id] = {
+                    "index": index,
+                    "status": status,
+                    "result": result,
+                    "table": table_id,
+                    "record": record
+                }
+
+                # 同時追蹤到待回填佇列
+                if table_id:
+                    self.track_pending_record(table_id, round_id, status, index)
+
+    def sliding_band_backfill(self) -> List[Dict[str, Any]]:
+        """滑動帶回填：在第一頁搜尋帶內尋找已派彩的牌局"""
+        backfilled_records = []
+        now = time.time()
+
+        for table, rounds in self.pending.items():
+            rounds_to_remove = []
+            rounds_to_upgrade = []
+
+            for round_id, meta in rounds.items():
+                age = now - meta["first_seen_ts"]
+                last_index = meta["last_index"]
+
+                # 檢查是否在當前掃描結果中
+                if round_id in self.current_scan_results:
+                    scan_result = self.current_scan_results[round_id]
+                    current_index = scan_result["index"]
+                    current_status = scan_result["status"]
+                    current_result = scan_result["result"]
+
+                    # 檢查是否在搜索帶內 (前 SEARCH_BAND 名)
+                    if current_index < SEARCH_BAND:
+                        # 更新位置信息
+                        meta["last_seen_ts"] = now
+                        meta["last_index"] = current_index
+                        meta["attempts"] += 1
+
+                        # 檢查是否已派彩
+                        is_completed = (current_result in (0, 1, 2, 3) or
+                                      any(keyword in current_status for keyword in ["已派彩", "派彩", "結束"]))
+
+                        if is_completed:
+                            logger.info(f"[SLIDING] Found completed game in band: {table}:{round_id} at index {current_index} ({current_status})")
+                            backfilled_records.append(scan_result["record"])
+                            rounds_to_remove.append(round_id)
+                        elif current_index > last_index + 40:  # 漂移太遠
+                            logger.debug(f"[SLIDING] Round drifted too far: {table}:{round_id} from {last_index} to {current_index}")
+                    else:
+                        meta["attempts"] += 1
+                        logger.debug(f"[SLIDING] Round outside search band: {table}:{round_id} at index {current_index}")
+
+                else:
+                    # 在當前掃描中找不到這筆
+                    meta["attempts"] += 1
+                    logger.debug(f"[SLIDING] Round not found in current scan: {table}:{round_id} (attempts: {meta['attempts']})")
+
+                # 檢查是否需要升級到精準搜尋
+                if (age > UPGRADE_TIME_SEC or meta["attempts"] >= UPGRADE_ATTEMPTS) and not meta["stale"]:
+                    if age < ZOMBIE_TIME_SEC:
+                        rounds_to_upgrade.append((table, round_id))
+                        meta["stale"] = True  # 標記為已升級，避免重複
+                        logger.info(f"[SLIDING] Upgrading to precise search: {table}:{round_id} (age: {age:.1f}s, attempts: {meta['attempts']})")
+                    else:
+                        # 超過僵屍線，直接放棄
+                        logger.info(f"[SLIDING] Dropping zombie round: {table}:{round_id} (age: {age:.1f}s)")
+                        rounds_to_remove.append(round_id)
+
+            # 清理已完成的項目
+            for round_id in rounds_to_remove:
+                del rounds[round_id]
+
+            # 添加到精準搜尋隊列
+            for item in rounds_to_upgrade:
+                if item not in self.precise_queue:
+                    self.precise_queue.append(item)
+
+        return backfilled_records
+
     async def connect_to_existing_browser(self):
         """连接到现有的Chrome实例"""
         try:
@@ -102,6 +290,14 @@ class ExistingBrowserMonitor:
                 logger.info("Created new page and navigated to target")
             
             await asyncio.sleep(3)  # 等待页面稳定
+            
+            # 🔹 Clean start: reload page once to kill any previously injected pollers
+            try:
+                await self.page.reload(wait_until="domcontentloaded")
+                await asyncio.sleep(1)
+                logger.info("[CLEAN] Page reloaded to clear old in-page pollers")
+            except Exception as e:
+                logger.debug(f"[CLEAN] Initial reload skipped: {e}")
             
             # 阻擋把 /api/** 當成 document 導航（防 405 GET）
             await self.page.route("**/api/**", lambda route, req: (
@@ -275,14 +471,16 @@ class ExistingBrowserMonitor:
                         return
 
                     body = await request.post_data() if request.method in ("POST","PUT","PATCH") else ""
+                    if request.method == "POST" and not body:
+                        return  # 不覆蓋
                     self.req_template = {
                         "method": request.method,
                         "url": url,
                         "headers": dict(request.headers),
-                        "body": body
+                        "body": body or ""
                     }
-                    logger.info(f"[TEMPLATE] captured {request.method} {url}")
                     await page.evaluate("window.__req_template__ = arguments[0]", self.req_template)
+                    logger.info(f"[TEMPLATE] captured {request.method} {url} (len(body)={len(body)})")
                 except Exception as e:
                     logger.debug(f"Template capture error: {e}")
             
@@ -300,15 +498,53 @@ class ExistingBrowserMonitor:
                         return
                     if "application/json" not in (response.headers or {}).get("content-type", ""):
                         return
+                    # Add DOM stability wait
+                    await asyncio.sleep(0.6)  # 600ms wait for DOM to stabilize
+
                     data = await response.json()
                     # 提取記錄並處理
                     records = self.extract_records(data)
                     if records:
-                        logger.info(f"[MIRROR] got {len(records)} records from passive monitoring")
-                        # 直接發送到 ingest
-                        success = await self.send_to_ingest(records)
-                        if success:
-                            self.stats["records_processed"] += len(records)
+                        # === 掃描全部100筆，準備 upsert 數據 ===
+                        all_records = records[:100]  # 確保掃描全部100筆
+
+                        # 防抖檢查：如果第一筆的局號沒變，跳過這次處理
+                        if all_records:
+                            first_round = all_records[0].get("round_id") or all_records[0].get("roundId")
+                            if first_round == self.last_first_round:
+                                self.skip_count += 1
+                                if self.skip_count <= 2:  # 容許連續 2 次相同
+                                    logger.debug(f"[UPSERT] Same first round {first_round}, skipping ({self.skip_count})")
+                                    return
+                            else:
+                                self.last_first_round = first_round
+                                self.skip_count = 0
+
+                        # 更新當前掃描結果 + 自動追蹤待回填
+                        self.update_scan_results(all_records)
+
+                        # 執行滑動帶回填檢查
+                        backfilled_records = self.sliding_band_backfill()
+
+                        # 合併所有記錄並發送完整快照用於 upsert
+                        all_to_send = []
+                        seen_keys = set()
+
+                        # 包含所有記錄（新的 + 回填的），後端會進行 upsert
+                        for record in all_records + backfilled_records:
+                            table_id = record.get("table_id") or record.get("tableId") or record.get("table")
+                            round_id = record.get("round_id") or record.get("roundId")
+                            if table_id and round_id:
+                                key = f"{table_id}:{round_id}"
+                                if key not in seen_keys:
+                                    all_to_send.append(record)
+                                    seen_keys.add(key)
+
+                        if all_to_send:
+                            logger.info(f"[UPSERT] sending {len(all_to_send)} records for upsert processing")
+                            success = await self.send_to_ingest(all_to_send)
+                            if success:
+                                self.stats["records_processed"] += len(all_to_send)
                 except Exception as e:
                     logger.debug(f"Mirror error: {e}")
 
@@ -334,30 +570,14 @@ class ExistingBrowserMonitor:
             
             async def _with_cookie_and_bearer(route, request):
                 try:
-                    # 只處理我們自己發的（poller 會加這個 header）
-                    if request.headers.get("x-monitor", "") != "1":
-                        await route.continue_()
+                    # 🛑 在軟刷新模式下，任何帶 X-Monitor: 1 的請求都是舊 poller 打的，直接擋掉
+                    if request.headers.get("x-monitor") == "1":
+                        logger.info("[BLOCK] Dropping leftover in-page poller request")
+                        await route.abort()
                         return
 
-                    headers = dict(request.headers)
-                    headers.pop("authorization", None)
-                    headers.pop("Authorization", None)
-
-                    # 每次現讀頁面 JWT
-                    jwt = await page.evaluate("() => window._jwt_current || ''")
-                    if jwt:
-                        headers["Authorization"] = f"Bearer {jwt}"
-
-                    # 補 Referer/Origin，禁快取
-                    try:
-                        headers.setdefault("Referer", await page.evaluate("() => location.href"))
-                        headers.setdefault("Origin", await page.evaluate("() => location.origin"))
-                    except Exception:
-                        pass
-                    headers["Pragma"] = "no-cache"
-                    headers["Cache-Control"] = "no-store"
-
-                    await route.continue_(headers=headers)
+                    # 其餘請求照常放行（不再主動加 Authorization 之類）
+                    await route.continue_()
                 except Exception:
                     await route.continue_()
             
@@ -433,7 +653,7 @@ class ExistingBrowserMonitor:
             
             # 生成时间范围
             now = datetime.datetime.now()
-            start_time = (now - datetime.timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
+            start_time = (now - datetime.timedelta(minutes=LOOKBACK_MINUTES)).strftime("%Y-%m-%d %H:%M:%S")
             end_time = now.strftime("%Y-%m-%d %H:%M:%S")
             
             # 3) 更新的頁面評估：每次現讀 window._jwt_current
@@ -469,7 +689,24 @@ class ExistingBrowserMonitor:
                 cache: 'no-store',
                 body: JSON.stringify(payload)
               }});
-            
+
+              // HTTP 500 重試機制（最多 3 次）
+              let http500_retries = 0;
+              while (res.status === 500 && http500_retries < 3) {{
+                http500_retries++;
+                const retryDelay = 1000 + (http500_retries * 500); // 1s, 1.5s, 2s
+                console.debug(`[HTTP 500] Retry ${{http500_retries}}/3 after ${{retryDelay}}ms`);
+                await new Promise(r => setTimeout(r, retryDelay));
+
+                res = await fetch('https://i.t9live3.vip/api/game/result/search', {{
+                  method: 'POST',
+                  headers: buildHeaders(),
+                  credentials: 'include',
+                  cache: 'no-store',
+                  body: JSON.stringify(payload)
+                }});
+              }}
+
               // 202 正規輪詢（最多 5 次）
               let tries = 0;
               while (res.status === 202 && tries < 5) {{
@@ -485,10 +722,10 @@ class ExistingBrowserMonitor:
                 }});
                 tries++;
               }}
-            
+
               let data = {{}};
               try {{ data = await res.json(); }} catch {{}}
-              return {{ success: res.ok, status: res.status, data, jwt_used: jwt.substring(0, 20) }};
+              return {{ success: res.ok, status: res.status, data, jwt_used: jwt.substring(0, 20), http500_retries }};
             }}
             """)
             
@@ -530,28 +767,59 @@ class ExistingBrowserMonitor:
         try:
             if not isinstance(data, dict):
                 return []
-            
+
+            records = []
+
             # 尝试多种数据结构
             if 'data' in data and isinstance(data['data'], dict):
                 d = data['data']
                 if isinstance(d.get('rows'), list):
-                    return d['rows']
-                if isinstance(d.get('list'), list):
-                    return d['list']
-                if isinstance(d.get('data'), list):
-                    return d['data']
-            
-            if isinstance(data.get('data'), list):
-                return data['data']
-            
-            # 通用提取
-            for key in ("records", "items", "list", "result", "rows"):
-                value = data.get(key)
-                if isinstance(value, list):
-                    return value
-            
+                    records = d['rows']
+                elif isinstance(d.get('list'), list):
+                    records = d['list']
+                elif isinstance(d.get('data'), list):
+                    records = d['data']
+            elif isinstance(data.get('data'), list):
+                records = data['data']
+            else:
+                # 通用提取
+                for key in ("records", "items", "list", "result", "rows"):
+                    value = data.get(key)
+                    if isinstance(value, list):
+                        records = value
+                        break
+
+            # 過濾不穩定的記錄
+            if records:
+                filtered_records = []
+                blockchain_filtered = 0
+                unstable_status_filtered = 0
+
+                for record in records:
+                    table_id = record.get('table_id', '')
+                    payment_status = record.get('game_payment_status')
+                    game_result = record.get('gameResult', {})
+                    result = game_result.get('result') if isinstance(game_result, dict) else None
+
+                    # 過濾1: T9Blockchains桌台（取消率過高）
+                    if table_id.startswith('T9Blockchains_'):
+                        blockchain_filtered += 1
+                        continue
+
+                    # 過濾2: payment_status=1且沒有最終結果的記錄（48%取消率）
+                    if payment_status == 1 and result not in [1, 2, 3]:  # 只保留有明確結果的status=1記錄
+                        unstable_status_filtered += 1
+                        continue
+
+                    filtered_records.append(record)
+
+                if blockchain_filtered > 0 or unstable_status_filtered > 0:
+                    logger.debug(f"Filtered out {blockchain_filtered} blockchain + {unstable_status_filtered} unstable status records")
+
+                return filtered_records
+
             return []
-            
+
         except Exception as e:
             logger.error(f"Record extraction error: {e}")
             return []
@@ -628,6 +896,112 @@ class ExistingBrowserMonitor:
                 logger.error(f"Monitor loop error: {e}")
                 await asyncio.sleep(5)
     
+    async def lookup_round_in_page(self, round_id: str) -> bool:
+        """使用頁面 UI 精準搜索特定局號"""
+        try:
+            page = self.page
+            if not page:
+                return False
+
+            logger.debug(f"[BACKFILL] Looking up round {round_id}")
+
+            # 1) 尋找「局號」輸入框（多種可能的選擇器）
+            input_box = None
+            try:
+                # 嘗試不同的選擇器
+                selectors = [
+                    'input[placeholder*="局"]',
+                    'input[placeholder*="round"]',
+                    'input[placeholder*="Round"]',
+                    '.el-input input[placeholder*="局"]',
+                    '.ant-input[placeholder*="局"]',
+                    'input[name*="round"]'
+                ]
+
+                for selector in selectors:
+                    elements = await page.query_selector_all(selector)
+                    if elements:
+                        input_box = elements[0]
+                        logger.debug(f"[BACKFILL] Found input box with selector: {selector}")
+                        break
+
+                if not input_box:
+                    logger.debug("[BACKFILL] No round input box found")
+                    return False
+
+            except Exception as e:
+                logger.debug(f"[BACKFILL] Input box search error: {e}")
+                return False
+
+            # 2) 尋找搜索按鈕
+            search_btn = None
+            try:
+                btn_selectors = [
+                    'button:has-text("檢索")',
+                    'button:has-text("搜索")',
+                    'button:has-text("查詢")',
+                    'button:has-text("查询")',
+                    '.el-button:has-text("檢索")',
+                    '.ant-btn:has-text("搜索")'
+                ]
+
+                for selector in btn_selectors:
+                    try:
+                        search_btn = await page.query_selector(selector)
+                        if search_btn:
+                            logger.debug(f"[BACKFILL] Found search button with selector: {selector}")
+                            break
+                    except:
+                        continue
+
+                if not search_btn:
+                    logger.debug("[BACKFILL] No search button found")
+                    return False
+
+            except Exception as e:
+                logger.debug(f"[BACKFILL] Search button error: {e}")
+                return False
+
+            # 3) 輸入局號並點擊搜索
+            await input_box.clear()
+            await input_box.fill(str(round_id))
+            await asyncio.sleep(0.5)  # 短暫等待
+
+            await search_btn.click()
+            await asyncio.sleep(1.5)  # 等待搜索結果
+
+            # 4) 檢查搜索結果
+            try:
+                # 尋找結果表格
+                table_rows = await page.query_selector_all("table tbody tr")
+                if not table_rows:
+                    logger.debug(f"[BACKFILL] No results found for round {round_id}")
+                    return False
+
+                # 檢查第一行是否包含目標局號
+                first_row = table_rows[0]
+                row_text = await first_row.inner_text()
+
+                if str(round_id) in row_text:
+                    logger.debug(f"[BACKFILL] Found target round in results: {round_id}")
+
+                    # 5) 解析並發送這條記錄
+                    # 這裡需要根據實際頁面結構解析
+                    # 簡化版本：觸發現有的鏡射機制來處理結果
+                    await asyncio.sleep(0.5)  # 讓鏡射有時間捕獲
+                    return True
+                else:
+                    logger.debug(f"[BACKFILL] Round {round_id} not found in results")
+                    return False
+
+            except Exception as e:
+                logger.debug(f"[BACKFILL] Result parsing error: {e}")
+                return False
+
+        except Exception as e:
+            logger.debug(f"[BACKFILL] Lookup error for round {round_id}: {e}")
+            return False
+
     async def discover_and_arm_template(self, timeout_ms: int = 20000):
         page = self.page
         context = self.browser.contexts[0]
@@ -768,9 +1142,12 @@ class ExistingBrowserMonitor:
         const pad = (n)=> (n<10?'0':'')+n;
         const ts = (d)=> `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
         const endTime = ts(now);
-        const startTime = ts(new Date(now.getTime() - 5*60*1000)); // 近 5 分鐘
+        const startTime = ts(new Date(now.getTime() - {LOOKBACK_MINUTES}*60*1000)); // 近 {LOOKBACK_MINUTES} 分鐘
 
-        const token = (typeof window._jwt_current === 'string' && window._jwt_current) ? window._jwt_current : '';
+        const token = (window._jwt_current
+                       || localStorage.getItem('access_token')
+                       || sessionStorage.getItem('access_token')
+                       || '').toString();
         let resp;
 
         if (window.__req_template__) {
@@ -793,7 +1170,7 @@ class ExistingBrowserMonitor:
           sp.set('startTime', startTime);
           sp.set('endTime',   endTime);
           sp.set('pageIndex', '1');
-          sp.set('pageSize',  '100');
+          sp.set('pageSize',  '{BATCH_SIZE}');
           const targetUrl = urlObj.toString();
 
           try {
@@ -802,7 +1179,7 @@ class ExistingBrowserMonitor:
             obj.startTime = startTime;
             obj.endTime = endTime;
             if ('pageIndex' in obj) obj.pageIndex = 1;
-            if ('pageSize'  in obj) obj.pageSize  = 100;
+            if ('pageSize'  in obj) obj.pageSize  = {BATCH_SIZE};
             body = JSON.stringify(obj);
             h.set('Content-Type', h.get('Content-Type') || 'application/json;charset=UTF-8');
           } catch {
@@ -812,7 +1189,7 @@ class ExistingBrowserMonitor:
               if (p.has('startTime')) p.set('startTime', startTime);
               if (p.has('endTime'))   p.set('endTime',   endTime);
               if (p.has('pageIndex')) p.set('pageIndex', '1');
-              if (p.has('pageSize'))  p.set('pageSize',  '100');
+              if (p.has('pageSize'))  p.set('pageSize',  '{BATCH_SIZE}');
               body = p.toString();
               h.set('Content-Type', h.get('Content-Type') || 'application/x-www-form-urlencoded; charset=UTF-8');
             } catch {}
@@ -823,14 +1200,41 @@ class ExistingBrowserMonitor:
           resp = await fetch(targetUrl, opts);
           console.debug('[POLLER] used template', method, targetUrl, '→', resp.status);
         } else {
-          // 沒模板就先略（或用你原本的保守 payload）
-          resp = await fetch('https://i.t9live3.vip/api/game/result/search', {
-            method:'POST',
-            headers: (()=>{ const hh=new Headers({'X-Monitor':'1','Accept':'application/json, text/plain, */*','Content-Type':'application/json;charset=UTF-8'}); if(token) hh.set('Authorization','Bearer '+token); return hh; })(),
-            credentials:'include', cache:'no-store',
-            body: JSON.stringify({ startTime, endTime, pageIndex:1, pageSize:100 })
-          });
-          console.debug('[POLLER] used default payload →', resp.status);   // ← 新增這行
+          const body = {
+            // 站方常用欄位，盡量齊
+            startTime, endTime,
+            game_code: 'baccarat',   // 若不需要也無妨；後端會忽略
+            page: 1, pageNum: 1, pageIndex: 1,
+            pageSize: {BATCH_SIZE}, limit: {BATCH_SIZE}, rowsCount: {BATCH_SIZE}
+          };
+          // HTTP 500 重試機制 for in-page poller
+          let http500_retries = 0;
+          const maxRetries = 2;
+
+          do {
+            resp = await fetch('https://i.t9live3.vip/api/game/result/search', {
+              method:'POST',
+              headers:(()=>{const hh=new Headers({
+                'X-Monitor':'1',
+                'Accept':'application/json, text/plain, */*',
+                'Content-Type':'application/json;charset=UTF-8',
+                'X-Requested-With':'XMLHttpRequest'
+              }); if(token) hh.set('Authorization','Bearer '+token); return hh;})(),
+              credentials:'include', cache:'no-store',
+              body: JSON.stringify(body)
+            });
+
+            if (resp.status === 500 && http500_retries < maxRetries) {
+              http500_retries++;
+              const retryDelay = 800 + (http500_retries * 400); // 0.8s, 1.2s
+              console.debug(`[POLLER] HTTP 500 retry ${http500_retries}/${maxRetries} after ${retryDelay}ms`);
+              await sleep(retryDelay);
+            } else {
+              break;
+            }
+          } while (http500_retries <= maxRetries);
+
+          console.debug('[POLLER] used default payload →', resp.status, http500_retries > 0 ? `(retries: ${http500_retries})` : '');
         }
 
         // 處理非OK狀態
@@ -871,6 +1275,11 @@ class ExistingBrowserMonitor:
 
         state.etag = resp.headers.get('ETag') || state.etag;
         const json = await resp.json();
+        
+        const biz = json?.code ?? json?.data?.code;
+        if (typeof biz !== 'undefined' && biz !== 200) {
+          console.debug('[POLLER] api code=', biz, 'msg=', json?.msg || json?.message);
+        }
         const list =
           (json?.data?.list) ||
           (json?.data?.rows) ||
@@ -931,147 +1340,209 @@ class ExistingBrowserMonitor:
 
         logger.info(f"Started in-page poller with {interval_ms}ms interval")
 
-    async def soft_refresh_every(self, seconds: int = 8):
-        """
-        智慧輕刷新：模擬人真的按了「查詢/刷新」，讓站方的 JS 把快照重建、再發出 XHR
-        現在針對所有同源 iframe 進行嘗試
-        """
-        logger.info(f"Starting smart soft refresh every {seconds} seconds")
+    async def precise_search_worker(self):
+        """精準搜尋工人：處理升級到精準搜尋的牌局"""
+        logger.info(f"Starting precise search worker (interval: {PRECISE_WORKER_INTERVAL}s)")
+
         while self.is_running:
             try:
-                logger.debug(f"[SOFT_REFRESH] Starting refresh cycle, is_running={self.is_running}")
-                
-                # 針對主頁面和所有同源 iframe 都執行軟刷新
-                if not self.page:
-                    logger.warning(f"[SOFT_REFRESH] Page is None, skipping refresh cycle")
-                    await asyncio.sleep(seconds)
+                await asyncio.sleep(PRECISE_WORKER_INTERVAL)
+
+                if not self.page or not self.precise_queue:
                     continue
-                    
-                frames = self.page.frames
-                logger.debug(f"[SOFT_REFRESH] Found {len(frames)} frames to check")
-                
-                for i, frame in enumerate(frames):
-                    try:
-                        frame_url = frame.url
-                        logger.debug(f"[SOFT_REFRESH] Checking frame {i}: {frame_url}")
-                        
-                        if not frame_url or "t9live3.vip" not in frame_url:
-                            logger.debug(f"[SOFT_REFRESH] Skipping frame {i} - not t9live3 domain")
-                            continue
-                        
-                        success = await frame.evaluate("""
-                        (() => {
-                          const T_NOW = Date.now();
-                          const byText = (el) => (el.innerText || el.textContent || "").trim();
 
-                          // 深度遍歷 (含 shadowRoot)
-                          const all = [];
-                          const walk = (root) => {
-                            const iter = document.createNodeIterator(root, NodeFilter.SHOW_ELEMENT);
-                            for (let n = iter.nextNode(); n; n = iter.nextNode()) {
-                              all.push(n);
-                              if (n.shadowRoot) walk(n.shadowRoot);
-                            }
-                            // 也掃一次常見的 open shadow 裏的 button
-                            (root.querySelectorAll?.('slot') || []).forEach(slot => {
-                              slot.assignedElements?.().forEach(el => { all.push(el); if (el.shadowRoot) walk(el.shadowRoot); });
-                            });
-                          };
-                          walk(document);
+                # 取出一個待處理項目
+                table, round_id = self.precise_queue.pop(0)
+                logger.info(f"[PRECISE] Processing {table}:{round_id}")
 
-                          const click = (el, why) => {
-                            try {
-                              el.click?.(); // 先用原生 click（許多框架綁 onClick）
-                              el.dispatchEvent?.(new MouseEvent('click', {bubbles:true, cancelable:true}));
-                              console.debug('[SOFT_REFRESH] Clicked:', why, '→', (byText(el) || el.className || el.id || el.tagName));
-                              return true;
-                            } catch (e) {
-                              console.debug('[SOFT_REFRESH] click failed:', e.message);
-                              return false;
-                            }
-                          };
+                # 執行精準搜索
+                success = await self.lookup_round_in_page(round_id)
 
-                          const kw = /刷新|查詢|查询|搜尋|搜索|查找|更新|重新整理|Search|Refresh|Reload|Update/;
+                if success:
+                    # 成功找到並處理，從待回填中移除
+                    if round_id in self.pending[table]:
+                        del self.pending[table][round_id]
+                        logger.info(f"[PRECISE] Successfully found and removed {table}:{round_id}")
+                else:
+                    # 精準搜尋失敗，檢查是否需要重新排隊
+                    if round_id in self.pending[table]:
+                        meta = self.pending[table][round_id]
+                        age = time.time() - meta["first_seen_ts"]
 
-                          // 1) 直接看文字命中
-                          let btn = all.find(el =>
-                            (el.matches?.('button,[role="button"],.el-button,.ant-btn,.btn,a[role="button"],a.button')) &&
-                            kw.test(byText(el))
-                          );
-                          if (btn && click(btn, 'byText')) return true;
-
-                          // 2) 常見 UI 類名/圖示（Element/Ant/自定義 icon）
-                          btn = all.find(el =>
-                            el.matches?.('[class*="refresh"],[class*="reload"],[class*="search"],[data-action*="refresh"],[data-action*="search"],.el-button--primary,.ant-btn-primary')
-                          );
-                          if (btn && click(btn, 'byClass')) return true;
-
-                          // 3) 沒命中就 bump hash 促使路由重取
-                          try {
-                            const hash = (location.hash || '#/').split('?')[0];
-                            const p = new URLSearchParams((location.hash.split('?')[1]||''));
-                            p.set('_ts', String(T_NOW));
-                            const nh = hash + '?' + p.toString();
-                            if (nh !== location.hash) { location.hash = nh; console.debug('[SOFT_REFRESH] Bumped hash'); return true; }
-                          } catch (e) {}
-
-                          // 4) 實在沒招，發自訂事件
-                          try { (document.querySelector('#app') || document.body)
-                                .dispatchEvent(new Event('force-fetch', {bubbles:true})); 
-                                console.debug('[SOFT_REFRESH] Dispatched force-fetch'); 
-                                return true; } catch(e){}
-
-                          console.debug('[SOFT_REFRESH] No trigger');
-                          return false;
-                        })();
-                        """)
-                        
-                        if success:
-                            logger.info(f"[SOFT_REFRESH] Triggered successfully in frame: {frame_url}")
-
-                            # 1) 先給頁面 3 秒時間，看它會不會真的發出 XHR
-                            try:
-                                await self.page.wait_for_response(
-                                    lambda r: ("i.t9live3.vip/api/game/result/search" in r.url) and
-                                              (getattr(r.request, "resource_type", "") in ("xhr", "fetch")),
-                                    timeout=3_000
-                                )
-                                logger.info("[SOFT_REFRESH] Observed search XHR from page")
-                            except Exception:
-                                # 2) 如果 3 秒內完全沒有 XHR，就直接由我們自己拉一次（不等下一輪）
-                                logger.warning("[SOFT_REFRESH] No XHR observed — falling back to direct pull")
-                                try:
-                                    data = await self.make_api_request()                # 直接在頁內 fetch
-                                    if data and not data.get("_err"):
-                                        records = self.extract_records(data)
-                                        if records:
-                                            ok = await self.send_to_ingest(records)
-                                            if ok:
-                                                self.stats["records_processed"] += len(records)
-                                                logger.info(f"[FALLBACK] pulled {len(records)} records via make_api_request()")
-                                except Exception as e:
-                                    logger.error(f"[FALLBACK] direct pull failed: {e}")
-
-                            # 3) 最後再催一次 poller（你已有 window.__poller_force_now__）
-                            try:
-                                await self.page.evaluate("window.__poller_force_now__ && window.__poller_force_now__()")
-                            except Exception:
-                                pass
-
-                            break
+                        if age < ZOMBIE_TIME_SEC:
+                            # 重新排隊，但降低優先級
+                            if len(self.precise_queue) < 10:  # 避免隊列太長
+                                self.precise_queue.append((table, round_id))
+                                logger.debug(f"[PRECISE] Re-queued {table}:{round_id} for retry")
                         else:
-                            logger.debug(f"[SOFT_REFRESH] No suitable trigger found in frame: {frame_url}")
-                            
-                    except Exception as e:
-                        logger.debug(f"[SOFT_REFRESH] Error in frame {frame.url}: {e}")
-                        continue
-                
-                logger.debug(f"[SOFT_REFRESH] Refresh cycle complete, sleeping for {seconds} seconds")
-                    
+                            # 超過僵屍線，放棄
+                            del self.pending[table][round_id]
+                            logger.info(f"[PRECISE] Dropping zombie round {table}:{round_id} (age: {age:.1f}s)")
+
+                # 節流控制
+                await asyncio.sleep(PRECISE_WORKER_INTERVAL)
+
             except Exception as e:
-                logger.error(f"[SOFT_REFRESH] General error: {e}")
+                logger.error(f"[PRECISE] Error in precise search worker: {e}")
+                await asyncio.sleep(5)
+
+    async def soft_refresh_every(self, base_seconds: int = 5):
+        """
+        智慧輕刷新：精準點擊上方工具列的「檢索」按鈕，避開左側選單
+        增加節流控制，避免頻繁點擊「檢索」按鈕
+        """
+        logger.info(f"Starting smart soft refresh every ~{base_seconds}s with throttling")
+        self._sr_fail = 0
+        self._last_search_click = 0  # 記錄上次點擊檢索的時間
+        self._min_search_interval = 8  # 最小檢索間隔（秒）
+        
+        while self.is_running:
+            try:
+                # 檢查頁籤可見性與防重入
+                busy = await self.page.evaluate("""
+(() => {
+  // 頁籤不可見 → 跳過
+  if (document.hidden) return 'HIDDEN';
+
+  // 還在處理上一次點擊 → 跳過
+  if (window.__softRefreshBusy__) return 'BUSY';
+
+  // 標記進行中，並設一個保險超時（避免永遠卡著）
+  window.__softRefreshBusy__ = true;
+  window.__softRefreshStartedAt__ = Date.now();
+  setTimeout(() => { window.__softRefreshBusy__ = false; }, 8000);
+  return 'OK';
+})()
+""")
+                if busy != "OK":
+                    # HIDDEN 或 BUSY 都先睡一小會再回來
+                    await asyncio.sleep(1.2)
+                    continue
                 
-            await asyncio.sleep(seconds)
+                # 節流控制：檢查是否距離上次點擊檢索按鈕太近
+                current_time = time.time()
+                time_since_last_click = current_time - self._last_search_click
+
+                if time_since_last_click < self._min_search_interval:
+                    logger.debug(f"[THROTTLE] Skipping search click, too soon ({time_since_last_click:.1f}s < {self._min_search_interval}s)")
+                    # Wait for DOM to stabilize after refresh
+                    await asyncio.sleep(random.uniform(0.4, 0.8))
+                    continue
+
+                clicked = False
+                for frame in self.page.frames:
+                    if "i.t9live3.vip" not in frame.url:
+                        continue
+
+                    # --- A. 用 Locator 精準點「檢索」 ---
+                    try:
+                        # 1) 首選：role=button, name=檢索/查询/搜尋/搜索
+                        btn = frame.get_by_role(
+                            "button",
+                            name=re.compile(r"(檢索|检索|查询|查詢|搜尋|搜索|Search|Refresh)")
+                        ).first
+                        await btn.scroll_into_view_if_needed(timeout=1000)
+                        # 避開左側選單：只點畫面中間偏右的按鈕
+                        box = await btn.bounding_box()
+                        if box and box["x"] > 220:    # 左邊選單大多 < 200px
+                            await btn.click(timeout=1500)
+                            self._last_search_click = current_time  # 更新上次點擊時間
+                            logger.info(f"[SOFT_REFRESH] Locator clicked: 檢索 ({frame.url})")
+                            clicked = True
+                        else:
+                            raise Exception("button too left")
+                    except Exception:
+                        # 2) 備援：找包含「檢索」文本的可點元素，且限制在上方工具列區域
+                        try:
+                            await frame.evaluate("""
+                            (() => {
+                              const byText = el => (el.innerText||el.textContent||'').trim();
+                              const kw = /檢索|检索|查询|查詢|搜尋|搜索|Search|Refresh/;
+                              const regionTop = 80, regionBottom = 220, regionLeft = 220; // 上方工具列大致區域
+                              const cand = Array.from(document.querySelectorAll('button,[role="button"],.btn,.el-button,.ant-btn,a.button,a[role="button"]'))
+                                .filter(el => {
+                                  const r = el.getBoundingClientRect();
+                                  return kw.test(byText(el)) && r.top>=regionTop && r.bottom<=regionBottom && r.left>=regionLeft;
+                                });
+                              const target = cand[0];
+                              if (target){
+                                target.click?.();
+                                target.dispatchEvent?.(new MouseEvent('click',{bubbles:true,cancelable:true}));
+                                console.debug('[SOFT_REFRESH] Clicked: 檢索 (fallback)');
+                                return true;
+                              }
+                              return false;
+                            })()
+                            """)
+                            self._last_search_click = current_time  # 更新上次點擊時間
+                            clicked = True
+                        except Exception:
+                            pass
+
+                    if not clicked:
+                        continue
+
+                    # B) 等 2 秒看是否有頁面自己發出的 XHR；沒有就做一次 fallback
+                    xhr_observed = False
+                    try:
+                        await self.page.wait_for_response(
+                            lambda r: ("i.t9live3.vip/api/game/result/search" in r.url)
+                                      and (getattr(r.request, "resource_type", "") in ("xhr","fetch")),
+                            timeout=2000
+                        )
+                        logger.info("[SOFT_REFRESH] Observed page XHR")
+                        xhr_observed = True
+                        self._sr_fail = 0
+                    except Exception:
+                        logger.warning("[SOFT_REFRESH] No XHR observed — falling back to direct pull")
+                        
+                        # 直接拉取作為 fallback
+                        try:
+                            data = await self.make_api_request()
+                            if data and not data.get("_err"):
+                                records = self.extract_records(data)
+                                if records:
+                                    # 去重 + 只取前 BATCH_SIZE 筆
+                                    new_records = self._dedupe_new(records)[:BATCH_SIZE]
+                                    if new_records:
+                                        logger.info(f"[FALLBACK] pulled {len(new_records)} new records")
+                                        success = await self.send_to_ingest(new_records)
+                                        if success:
+                                            self.stats["records_processed"] += len(new_records)
+                                            self._sr_fail = 0
+                                        else:
+                                            self._sr_fail += 1
+                                    else:
+                                        logger.debug("[FALLBACK] no new records after dedup")
+                                        self._sr_fail = 0  # 雖然沒新資料，但請求本身成功
+                                else:
+                                    self._sr_fail += 1
+                            else:
+                                self._sr_fail += 1
+                        except Exception as fallback_error:
+                            logger.debug(f"[FALLBACK] error: {fallback_error}")
+                            self._sr_fail += 1
+                    
+                    # Wait for DOM to stabilize after refresh
+                    await asyncio.sleep(random.uniform(0.4, 0.8))
+
+                    break  # 這一輪已經成功處理；跳出 frame 迴圈
+
+            except Exception as e:
+                logger.debug(f"Smart refresh error: {e}")
+                self._sr_fail += 1
+            finally:
+                # 清除防重入旗標
+                try:
+                    await self.page.evaluate("window.__softRefreshBusy__ = false")
+                except:
+                    pass
+
+            # 帶一點抖動，避免節律痕跡，並加入退避邏輯
+            base = base_seconds + random.uniform(0.4, 1.0)
+            if self._sr_fail >= 3:
+                base += random.uniform(10, 20)  # 退避一會，給站方喘息
+            await asyncio.sleep(base)
                 
     async def _handle_consecutive_failures(self):
         """处理连续101错误的自我修复"""
@@ -1103,53 +1574,43 @@ class ExistingBrowserMonitor:
     
     async def start(self):
         """启动监控器"""
-        try:
-            logger.info("Starting Existing Browser Monitor...")
-            
-            # 连接到现有浏览器
-            if not await self.connect_to_existing_browser():
-                raise RuntimeError("Failed to connect to existing browser")
-            
-            # 等待JWT準備好再啟動輪詢器（最長15秒）
-            try:
-                await self.page.wait_for_function(
-                    "window._jwt_current && window._jwt_current.length > 10",
-                    timeout=15_000
-                )
-                logger.info("JWT is ready, starting poller...")
-            except Exception as e:
-                logger.warning(f"JWT wait timeout: {e}. Starting poller anyway...")
-            
-            # 自動發現並捕獲模板（best-effort，不讓它阻斷啟動）
+        logger.info("Starting Existing Browser Monitor...")
+        if not await self.connect_to_existing_browser():
+            raise RuntimeError("Failed to connect to existing browser")
+
+        self.is_running = True
+        
+        if ACTIVE_PULL:
             try:
                 ok = await self.discover_and_arm_template(timeout_ms=20000)
                 logger.info(f"Template armed: {ok}")
             except Exception as e:
                 logger.warning(f"Template discovery skipped: {e}")
-            
-            # ✅ 先標記正在跑
-            self.is_running = True
-            
-            # 启动頁內輪詢器
             await self.start_poller(interval_ms=1000)
-            
-            # 啟動軟刷新（可選，背景執行）
-            soft_refresh_task = asyncio.create_task(self.soft_refresh_every(8))
-            
-            try:
-                await self.monitor_loop()
-            finally:
-                # 取消軟刷新任務
-                soft_refresh_task.cancel()
-                try:
-                    await soft_refresh_task
-                except asyncio.CancelledError:
-                    pass
-            
-        except Exception as e:
-            logger.error(f"Monitor startup failed: {e}")
-            raise
+        else:
+            logger.info("ACTIVE_PULL=False → 跳過模板偵測與 in-page poller（改走 soft-refresh-only）")
+
+        # === 啟動三任務：軟刷新 + 滑動帶檢測 + 精準搜尋工人 ===
+        soft_refresh_task = asyncio.create_task(self.soft_refresh_every(int(SOFT_REFRESH_SEC)))
+        precise_worker_task = asyncio.create_task(self.precise_search_worker())
+
+        logger.info("Started sliding band backfill system with precise search worker")
+
+        try:
+            # 簡單保活即可（主要工作由滑動帶檢測在鏡射中完成）
+            while self.is_running:
+                await asyncio.sleep(60)
         finally:
+            soft_refresh_task.cancel()
+            precise_worker_task.cancel()
+            try:
+                await soft_refresh_task
+            except asyncio.CancelledError:
+                pass
+            try:
+                await precise_worker_task
+            except asyncio.CancelledError:
+                pass
             await self.cleanup()
     
     async def stop(self):
@@ -1174,11 +1635,45 @@ class ExistingBrowserMonitor:
             self.stats["successful_requests"] / max(1, self.stats["total_requests"]) * 100
         )
         
+        # 統計滑動帶回填狀態
+        total_pending = sum(len(rounds) for rounds in self.pending.values())
+        pending_by_table = {table: len(rounds) for table, rounds in self.pending.items() if rounds}
+        precise_queue_size = len(self.precise_queue)
+
+        # 統計各狀態的牌局數量
+        pending_stats = {"新發現": 0, "追蹤中": 0, "已升級": 0}
+        now = time.time()
+
+        for table, rounds in self.pending.items():
+            for round_id, meta in rounds.items():
+                age = now - meta["first_seen_ts"]
+                if meta["stale"]:
+                    pending_stats["已升級"] += 1
+                elif age > UPGRADE_TIME_SEC or meta["attempts"] >= UPGRADE_ATTEMPTS:
+                    pending_stats["追蹤中"] += 1
+                else:
+                    pending_stats["新發現"] += 1
+
         return {
             **self.stats,
             "uptime_seconds": uptime,
             "success_rate_percent": round(success_rate, 2),
-            "is_running": self.is_running
+            "is_running": self.is_running,
+            "sliding_band_stats": {
+                "total_pending_rounds": total_pending,
+                "pending_by_table": pending_by_table,
+                "pending_by_status": pending_stats,
+                "precise_queue_size": precise_queue_size,
+                "scan_results_size": len(self.current_scan_results),
+                "config": {
+                    "scan_all_rows": SCAN_ALL_ROWS,
+                    "search_band": SEARCH_BAND,
+                    "upgrade_time_sec": UPGRADE_TIME_SEC,
+                    "upgrade_attempts": UPGRADE_ATTEMPTS,
+                    "soft_refresh_sec": SOFT_REFRESH_SEC,
+                    "precise_worker_interval": PRECISE_WORKER_INTERVAL
+                }
+            }
         }
 
 async def main():
