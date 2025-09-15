@@ -276,7 +276,7 @@
             const result = (typeof gameResult === 'object' && gameResult.result !== undefined) ? gameResult.result : -1;
             const status = (record.game_payment_status_name || "").trim();
 
-            if ([1, 2, 3].includes(result)) {
+            if ([0, 1, 2, 3].includes(result)) {
                 return 3;
             }
             if (['停止', '派彩', '結束'].some(keyword => status.includes(keyword))) {
@@ -732,8 +732,8 @@
                 const resultCode = gameResultData.result;
                 if (resultCode === 1) gameResult = '閒勝';
                 else if (resultCode === 2) gameResult = '和局';
-                else if (resultCode === 3) gameResult = '莊勝';
-                else if (resultCode === 0) gameResult = '取消/無效';
+                else if (resultCode === 0) gameResult = '莊勝';
+                else if (resultCode === 3) gameResult = '取消/無效';
             } else if (/(派彩|已彩|結束|finished)/i.test(status)) {
                 gameResult = '已派彩'; // 狀態 fallback：若沒有具體結果但狀態顯示已結束
             }

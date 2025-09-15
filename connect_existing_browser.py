@@ -1,19 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 """
 Connect to Existing Browser - 连接到你现有的浏览器会话
-
-这个方案不创建新的浏览器，而是连接到你已经登录的Chrome实例
+这个方案不创建新的浏览器，而是连接到你已经登录的 Chrome 实例
 """
 
 import asyncio
 import os
 import json
 import time
-import datetime
 import logging
-import random
-import re
 from typing import Optional, Dict, Any, List
 from collections import deque
 
@@ -26,232 +23,212 @@ load_dotenv()
 # 配置日志
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger("existing-browser-monitor")
 
 # 配置参数
 INGEST_URL = os.getenv("INGEST_URL", "http://127.0.0.1:8000/ingest")
 INGEST_KEY = os.getenv("INGEST_KEY", "baccaratt9webapi")
-POLL_INTERVAL = float(os.getenv("POLL_INTERVAL_SEC", "5.0"))
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "20"))
-LOOKBACK_MINUTES = int(os.getenv("LOOKBACK_MINUTES", "2"))
-ACTIVE_PULL = False  # 先關掉主動 make_api_request
-
-# === 新增滑動帶回填參數 ===
-SCAN_ALL_ROWS = int(os.getenv("SCAN_ALL_ROWS", "100"))      # 掃描第一頁全部100筆
-SEARCH_BAND = int(os.getenv("SEARCH_BAND", "60"))           # 搜索帶寬：前60名
-SOFT_REFRESH_SEC = float(os.getenv("SOFT_REFRESH_SEC", "7.0"))  # 軟刷新間隔
-UPGRADE_TIME_SEC = float(os.getenv("UPGRADE_TIME_SEC", "90.0"))  # 90秒後升級精準搜尋
-UPGRADE_ATTEMPTS = int(os.getenv("UPGRADE_ATTEMPTS", "8"))   # 8次找不到後升級
-ZOMBIE_TIME_SEC = float(os.getenv("ZOMBIE_TIME_SEC", "600.0"))  # 10分鐘僵屍線
-PRECISE_WORKER_INTERVAL = float(os.getenv("PRECISE_WORKER_INTERVAL", "1.2"))  # 精準搜尋節流
+POLL_INTERVAL_MS = int(os.getenv("POLL_INTERVAL_MS", "1000"))
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "100"))
+LOOKBACK_MINUTES = int(os.getenv("LOOKBACK_MINUTES", "2"))  # 目前頁內腳本自行使用 2 分鐘
 
 class ExistingBrowserMonitor:
     """连接现有浏览器的监控器"""
-    
+
     def __init__(self):
         self.playwright = None
         self.browser = None
         self.page = None
         self.is_running = False
-        self.consecutive_101_count = 0  # 连续101错误计数器
-        self.req_template = None  # 儲存真實頁面請求模板
+        self.consecutive_101_count = 0
+        self.req_template = None
         self.stats = {
             "start_time": time.time(),
             "total_requests": 0,
             "successful_requests": 0,
             "failed_requests": 0,
-            "records_processed": 0
+            "records_processed": 0,
         }
-        
         # 去重機制
         self._seen_set = set()
-        self._seen_keys = deque(maxlen=1000)  # 最多保留 1000 個 key，避免記憶體無限增長
+        self._seen_keys = deque(maxlen=1000)
 
-        # === 新增滑動帶回填機制 ===
-        from collections import defaultdict
-        self.pending = defaultdict(dict)  # {table: {round_id: metadata}}
-        # metadata: {"first_seen_ts", "last_seen_ts", "last_index", "attempts", "status", "stale"}
-        self.precise_queue = []  # 需要精準搜尋的隊列
-        self.current_scan_results = {}  # 當前掃描結果: {round_id: {"index", "status", "result", "table"}}
-
-        # 防抖機制
-        self.last_first_round = None
-        self.skip_count = 0
+        # Upsert 機制：狀態快取
+        self._sig_by_key = {}         # key -> 上次簽名（用來判斷有沒有變）
+        self._last_seen = {}          # key -> 最後見過時間（用於 TTL 清理）
+        self._key_order = deque(maxlen=2000)  # 插入順序，用於 TTL 清理
 
         logger.info("Existing Browser Monitor initialized")
-    
+
     def _uniq_key(self, record: Dict[str, Any]) -> Optional[str]:
         """產生記錄的唯一鍵 - 使用 table:round_id 作為主鍵"""
         table_id = record.get("table_id") or record.get("tableId") or record.get("table")
-        round_id = record.get("round_id") or record.get("roundId") or record.get("merchant_round_id") or record.get("id")
-
+        round_id = (
+            record.get("round_id")
+            or record.get("roundId")
+            or record.get("merchant_round_id")
+            or record.get("id")
+        )
         if table_id and round_id:
             return f"{table_id}:{round_id}"
-        
-        # 備案：table + start_time（如果沒有 round_id）
-        start_time = (record.get("game_start_time") or record.get("openTime") or
-                     record.get("start_time") or record.get("開局時間"))
 
+        # 備案：table + start_time（如果沒有 round_id）
+        start_time = (
+            record.get("game_start_time")
+            or record.get("openTime")
+            or record.get("start_time")
+            or record.get("開局時間")
+        )
         if table_id and start_time:
             return f"{table_id}@{start_time}"
         return None
 
-    def _dedupe_new(self, records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """去重並返回新記錄"""
-        out = []
+    def _status_signature(self, record: Dict[str, Any]) -> str:
+        """為記錄生成狀態簽名，用來判斷狀態是否有變更"""
+        r = record
+        ps = r.get('game_payment_status') or r.get('payment_status') or r.get('payStatus')
+        gr = None
+        if isinstance(r.get('gameResult'), dict):
+            gr = r['gameResult'].get('result')
+        gr = gr or r.get('result')
+        st = str(r.get('status') or r.get('game_status') or '').strip().lower()
+        st2 = str(r.get('settle_status') or '').strip().lower()
+        settled_at = r.get('settle_time') or r.get('settleTime') or r.get('paidAt') or ''
+        # 視需求也可把莊/閒點數放進來，但通常不用
+        return f"{ps}|{gr}|{st}|{st2}|{settled_at}"
+
+    def _upsert_changes(self, records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Upsert：同 key（table:round_id）若狀態簽名有變→輸出更新；沒變→略過；新 key→輸出新增。
+        另外做簡單 TTL 清理，避免快取過大。
+        """
+        out: List[Dict[str, Any]] = []
+        now = time.time()
+
         for r in records:
             k = self._uniq_key(r)
             if not k:
                 continue
-            if k in self._seen_set:
-                continue
-            out.append(r)
-            self._seen_set.add(k)
-            self._seen_keys.append(k)
-            # 當 deque 滿時自然會丟掉最舊的，但 set 還留著；
-            # 簡單處理：當長度差太大時重建一次（偶爾執行即可）
-            if len(self._seen_set) > len(self._seen_keys) + 500:
-                self._seen_set = set(self._seen_keys)
+            sig = self._status_signature(r)
+            prev = self._sig_by_key.get(k)
+
+            if prev is None:
+                # 首次出現 → 視為新增
+                self._sig_by_key[k] = sig
+                self._last_seen[k] = now
+                self._key_order.append(k)
+                out.append(r)
+            elif prev != sig:
+                # 狀態有變 → 視為更新
+                self._sig_by_key[k] = sig
+                self._last_seen[k] = now
+                out.append(r)
+            else:
+                # 沒變 → 只更新 last_seen
+                self._last_seen[k] = now
+
+        # 偶爾做 TTL 清理（例如 1 小時沒再看到就丟掉）
+        if len(self._key_order) >= self._key_order.maxlen * 0.9:
+            cutoff = now - 3600  # 1 小時
+            while self._key_order and self._last_seen.get(self._key_order[0], 0) < cutoff:
+                old = self._key_order.popleft()
+                self._sig_by_key.pop(old, None)
+                self._last_seen.pop(old, None)
+
         return out
 
-    def track_pending_record(self, table: str, round_id: str, status: str, index: int):
-        """追蹤未結束的牌局到滑動帶佇列"""
-        try:
-            now = time.time()
-            is_pending_status = any(keyword in status for keyword in ["投注中", "停止", "進行中"])
+    def _dedupe_new(self, records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """去重並返回新記錄，但允許狀態更新"""
+        out = []
 
-            if is_pending_status:
-                if round_id not in self.pending[table]:
-                    # 新的待回填項目
-                    self.pending[table][round_id] = {
-                        "first_seen_ts": now,
-                        "last_seen_ts": now,
-                        "last_index": index,
-                        "attempts": 0,
-                        "status": status,
-                        "stale": False
-                    }
-                    logger.debug(f"[SLIDING] Added to pending: {table}:{round_id} at index {index} ({status})")
-                else:
-                    # 更新現有項目
-                    self.pending[table][round_id].update({
-                        "last_seen_ts": now,
-                        "last_index": index,
-                        "status": status
-                    })
-            else:
-                # 已結束的牌局從待回填中移除
-                if round_id in self.pending[table]:
-                    del self.pending[table][round_id]
-                    logger.debug(f"[SLIDING] Removed from pending: {table}:{round_id} (completed: {status})")
+        # 維護進行中記錄的狀態快取
+        if not hasattr(self, '_pending_records'):
+            self._pending_records = {}  # key: uniq_key, value: record_state
 
-        except Exception as e:
-            logger.debug(f"Track pending error: {e}")
+        for r in records:
+            k = self._uniq_key(r)
+            if not k:
+                continue
 
-    def update_scan_results(self, records: List[Dict[str, Any]]):
-        """更新當前掃描結果"""
-        self.current_scan_results.clear()
-
-        for index, record in enumerate(records):
-            round_id = str(record.get("round_id") or record.get("roundId") or "")
-            if round_id:
-                table_id = (record.get("table_id") or record.get("tableId") or
-                           record.get("table") or str(record.get("台號", "")))
-                status = record.get("game_payment_status_name", "")
+            # 檢查記錄是否為進行中狀態
+            def is_in_progress_status(record):
+                payment_status = record.get("game_payment_status")
                 game_result = record.get("gameResult", {})
-                result = game_result.get("result", -1) if isinstance(game_result, dict) else -1
+                result = game_result.get("result") if isinstance(game_result, dict) else None
 
-                self.current_scan_results[round_id] = {
-                    "index": index,
-                    "status": status,
-                    "result": result,
-                    "table": table_id,
-                    "record": record
-                }
+                # payment_status=1 且沒有最終結果 = 進行中
+                # 注意：result=0 代表取消/無效，也是有效的最終結果
+                if payment_status == 1 and result not in [0, 1, 2, 3]:
+                    return True
 
-                # 同時追蹤到待回填佇列
-                if table_id:
-                    self.track_pending_record(table_id, round_id, status, index)
+                # 其他進行中的判斷條件
+                status = record.get("status", "") or record.get("game_status", "")
+                if status and status.lower() in ['進行中', '開獎中', 'running', 'in_progress']:
+                    return True
 
-    def sliding_band_backfill(self) -> List[Dict[str, Any]]:
-        """滑動帶回填：在第一頁搜尋帶內尋找已派彩的牌局"""
-        backfilled_records = []
-        now = time.time()
+                return False
 
-        for table, rounds in self.pending.items():
-            rounds_to_remove = []
-            rounds_to_upgrade = []
+            is_currently_in_progress = is_in_progress_status(r)
 
-            for round_id, meta in rounds.items():
-                age = now - meta["first_seen_ts"]
-                last_index = meta["last_index"]
+            # 如果是新記錄
+            if k not in self._seen_set:
+                out.append(r)
+                self._seen_set.add(k)
+                self._seen_keys.append(k)
 
-                # 檢查是否在當前掃描結果中
-                if round_id in self.current_scan_results:
-                    scan_result = self.current_scan_results[round_id]
-                    current_index = scan_result["index"]
-                    current_status = scan_result["status"]
-                    current_result = scan_result["result"]
+                # 如果是進行中狀態，記錄到pending快取
+                if is_currently_in_progress:
+                    self._pending_records[k] = {
+                        'record': r,
+                        'in_progress': True,
+                        'last_update': time.time()
+                    }
+                    logger.debug(f"[BACKFILL] New in-progress record: {k}")
 
-                    # 檢查是否在搜索帶內 (前 SEARCH_BAND 名)
-                    if current_index < SEARCH_BAND:
-                        # 更新位置信息
-                        meta["last_seen_ts"] = now
-                        meta["last_index"] = current_index
-                        meta["attempts"] += 1
+            # 如果是已見過的記錄，檢查是否有狀態變更
+            elif k in self._pending_records:
+                old_state = self._pending_records[k]
 
-                        # 檢查是否已派彩
-                        is_completed = (current_result in (0, 1, 2, 3) or
-                                      any(keyword in current_status for keyword in ["已派彩", "派彩", "結束"]))
+                # 如果從進行中變為已完成，允許更新
+                if old_state.get('in_progress', False) and not is_currently_in_progress:
+                    out.append(r)
+                    logger.info(f"[BACKFILL] Status update: {k} completed")
+                    # 從pending中移除已完成的記錄
+                    del self._pending_records[k]
 
-                        if is_completed:
-                            logger.info(f"[SLIDING] Found completed game in band: {table}:{round_id} at index {current_index} ({current_status})")
-                            backfilled_records.append(scan_result["record"])
-                            rounds_to_remove.append(round_id)
-                        elif current_index > last_index + 40:  # 漂移太遠
-                            logger.debug(f"[SLIDING] Round drifted too far: {table}:{round_id} from {last_index} to {current_index}")
-                    else:
-                        meta["attempts"] += 1
-                        logger.debug(f"[SLIDING] Round outside search band: {table}:{round_id} at index {current_index}")
+                elif is_currently_in_progress:
+                    # 仍在進行中，更新記錄但不重複處理
+                    self._pending_records[k] = {
+                        'record': r,
+                        'in_progress': True,
+                        'last_update': time.time()
+                    }
 
-                else:
-                    # 在當前掃描中找不到這筆
-                    meta["attempts"] += 1
-                    logger.debug(f"[SLIDING] Round not found in current scan: {table}:{round_id} (attempts: {meta['attempts']})")
+        # 清理超過10分鐘沒更新的pending記錄（避免記憶體洩漏）
+        current_time = time.time()
+        ten_minutes = 10 * 60  # 10分鐘
+        keys_to_remove = [
+            k for k, v in self._pending_records.items()
+            if current_time - v.get('last_update', 0) > ten_minutes
+        ]
+        for k in keys_to_remove:
+            logger.debug(f"[BACKFILL] Cleaning old pending record: {k}")
+            del self._pending_records[k]
 
-                # 檢查是否需要升級到精準搜尋
-                if (age > UPGRADE_TIME_SEC or meta["attempts"] >= UPGRADE_ATTEMPTS) and not meta["stale"]:
-                    if age < ZOMBIE_TIME_SEC:
-                        rounds_to_upgrade.append((table, round_id))
-                        meta["stale"] = True  # 標記為已升級，避免重複
-                        logger.info(f"[SLIDING] Upgrading to precise search: {table}:{round_id} (age: {age:.1f}s, attempts: {meta['attempts']})")
-                    else:
-                        # 超過僵屍線，直接放棄
-                        logger.info(f"[SLIDING] Dropping zombie round: {table}:{round_id} (age: {age:.1f}s)")
-                        rounds_to_remove.append(round_id)
+        # 當 deque 滿時自然會丟掉最舊的，但 set 還留著；
+        # 簡單處理：當長度差太大時重建一次（偶爾執行即可）
+        if len(self._seen_set) > len(self._seen_keys) + 500:
+            self._seen_set = set(self._seen_keys)
+        return out
 
-            # 清理已完成的項目
-            for round_id in rounds_to_remove:
-                del rounds[round_id]
-
-            # 添加到精準搜尋隊列
-            for item in rounds_to_upgrade:
-                if item not in self.precise_queue:
-                    self.precise_queue.append(item)
-
-        return backfilled_records
-
-    async def connect_to_existing_browser(self):
-        """连接到现有的Chrome实例"""
+    async def connect_to_existing_browser(self) -> bool:
+        """连接到现有的 Chrome 实例"""
         try:
             self.playwright = await async_playwright().start()
-            
-            # 尝试连接到调试端口上的Chrome
-            # 你需要用以下命令启动Chrome：
-            # chrome.exe --remote-debugging-port=9222 --user-data-dir="./chrome-debug"
-            
+
+            # 尝试连接到调试端口上的 Chrome
             try:
                 self.browser = await self.playwright.chromium.connect_over_cdp("http://localhost:9222")
                 logger.info("Connected to existing Chrome instance")
@@ -259,16 +236,15 @@ class ExistingBrowserMonitor:
                 logger.error(f"Failed to connect to Chrome on port 9222: {e}")
                 logger.info("Please start Chrome with: chrome.exe --remote-debugging-port=9222")
                 return False
-            
+
             # 获取现有的浏览器上下文
             if not self.browser.contexts:
                 logger.error("No browser contexts found. Please open a browser window first.")
                 return False
-            
-            # 选择第一个上下文（通常是默认的）
+
             context = self.browser.contexts[0]
             logger.info(f"Found {len(self.browser.contexts)} browser contexts")
-            
+
             # 获取页面
             if context.pages:
                 # 寻找包含目标域名的页面
@@ -277,53 +253,62 @@ class ExistingBrowserMonitor:
                     self.page = target_pages[0]
                     logger.info(f"Found target page: {self.page.url}")
                 else:
-                    # 使用第一个页面
-                    self.page = context.pages[0]
-                    logger.info(f"Using first available page: {self.page.url}")
-                    # 导航到目标页面
-                    await self.page.goto("https://i.t9live3.vip/#/gameResult", wait_until="networkidle")
-                    logger.info("Navigated to target page")
+                    # 排除 DevTools 页面，寻找其他页面
+                    non_devtools_pages = [p for p in context.pages if not p.url.startswith("devtools://")]
+                    if non_devtools_pages:
+                        self.page = non_devtools_pages[0]
+                        logger.info(f"Using non-devtools page: {self.page.url}")
+                        await self.page.goto("https://i.t9live3.vip/#/gameResult", wait_until="networkidle")
+                        logger.info("Navigated to target page")
+                    else:
+                        # 使用第一个页面
+                        self.page = context.pages[0]
+                        logger.info(f"Using first available page: {self.page.url}")
+                        await self.page.goto("https://i.t9live3.vip/#/gameResult", wait_until="networkidle")
+                        logger.info("Navigated to target page")
             else:
                 # 创建新页面
                 self.page = await context.new_page()
                 await self.page.goto("https://i.t9live3.vip/#/gameResult", wait_until="networkidle")
                 logger.info("Created new page and navigated to target")
-            
+
             await asyncio.sleep(3)  # 等待页面稳定
-            
-            # 🔹 Clean start: reload page once to kill any previously injected pollers
+
+            # Clean start: reload page once to kill any previously injected pollers
             try:
                 await self.page.reload(wait_until="domcontentloaded")
                 await asyncio.sleep(1)
                 logger.info("[CLEAN] Page reloaded to clear old in-page pollers")
             except Exception as e:
                 logger.debug(f"[CLEAN] Initial reload skipped: {e}")
-            
+
             # 阻擋把 /api/** 當成 document 導航（防 405 GET）
-            await self.page.route("**/api/**", lambda route, req: (
-                asyncio.create_task(route.abort()) if req.resource_type == "document" else asyncio.create_task(route.continue_())
-            ))
-            
-            # 1A) JWT 热更新初始化脚本：维护 window._jwt_current 并让 window.fetch 每次现读
+            async def _api_doc_guard(route, req):
+                if req.resource_type == "document":
+                    await route.abort()
+                else:
+                    await route.continue_()
+
+            await self.page.route("**/api/**", _api_doc_guard)
+
+            # JWT 热更新初始化脚本：维护 window._jwt_current 并让 window.fetch 每次现读
             page = self.page
             await page.add_init_script("""
 (() => {
   // 先从 storage 尝试读一次
-  const pick = () =>
-    window._jwt_current ||
-    localStorage.getItem('access_token') ||
-    sessionStorage.getItem('access_token') || '';
-
+  const pick = () => window._jwt_current || localStorage.getItem('access_token') || sessionStorage.getItem('access_token') || '';
   window._jwt_current = pick();
 
   const origFetch = window.fetch.bind(window);
-  window.fetch = async (input, init={}) => {
+  window.fetch = async (input, init = {}) => {
     const h = new Headers(init.headers || {});
     const t = (typeof window._jwt_current === 'string' && window._jwt_current) ? window._jwt_current : '';
     if (t && !h.has('Authorization')) h.set('Authorization', 'Bearer ' + t);
     init = { ...init, headers: h, credentials: 'include', cache: 'no-store' };
+
     const res = await origFetch(input, init);
 
+    // 嘗試從 JSON 回應裡面熱更新 access_token
     try {
       const clone = res.clone();
       const ct = clone.headers.get('content-type') || '';
@@ -338,11 +323,11 @@ class ExistingBrowserMonitor:
         }
       }
     } catch (e) {}
-    
+
     // 若命中 result/search/list，且回應成功，把本次請求形狀保存成模板
     try {
       const urlStr = (typeof input === 'string') ? input : (input && input.url) || '';
-      const low = urlStr.toLowerCase();
+      const low = (urlStr || '').toLowerCase();
       if (urlStr && low.includes('/api/') && low.includes('result') && (low.includes('search') || low.includes('list')) && res.ok) {
         const tpl = {
           method: (init && init.method) || 'GET',
@@ -354,17 +339,20 @@ class ExistingBrowserMonitor:
         console.debug('[TEMPLATE] saved from fetch hook');
       }
     } catch (e) {}
+
     return res;
   };
 })();
 """)
-            
-            # 1B) 补丁1: 真实检查 HttpOnly cookies + 等待登录
+
+            # 補丁1: 真实检查 HttpOnly cookies + 等待登录
             ctx = context
-            
             timeout = 300  # 最多等 300 秒 (5分钟)
             logger.info("Waiting for login in that Chrome window (polling cookies)...")
-            
+
+            auth_status = {}
+            all_cookies: List[Dict[str, Any]] = []
+
             for i in range(timeout):
                 # 检查所有相关域名的 cookies
                 all_cookies = []
@@ -372,44 +360,42 @@ class ExistingBrowserMonitor:
                     try:
                         cookies = await ctx.cookies(domain)
                         all_cookies.extend(cookies)
-                    except:
+                    except Exception:
                         pass
-                
+
                 # 也检查当前页面的所有 cookies
                 try:
                     page_cookies = await ctx.cookies()
                     all_cookies.extend(page_cookies)
-                except:
+                except Exception:
                     pass
-                
+
                 # 检查页面中的认证状态
                 auth_status = await page.evaluate("""
-                () => {
-                    try {
-                        return {
-                            hasLocalToken: !!(localStorage.getItem('access_token') || localStorage.getItem('token')),
-                            hasSessionToken: !!(sessionStorage.getItem('access_token') || sessionStorage.getItem('token')),
-                            hasJWT: !!window._jwt_current,
-                            currentUrl: location.href,
-                            cookieCount: document.cookie.split(';').filter(c => c.trim()).length,
-                            documentCookie: document.cookie.substring(0, 100) + '...'
-                        };
-                    } catch (e) {
-                        return { error: e.message };
-                    }
-                }
-                """)
-                
-                logger.debug(f"Auth check {i}: cookies={len(all_cookies)}, auth_status={auth_status}")
-                
+() => {
+  try {
+    return {
+      hasLocalToken: !!(localStorage.getItem('access_token') || localStorage.getItem('token')),
+      hasSessionToken: !!(sessionStorage.getItem('access_token') || sessionStorage.getItem('token')),
+      hasJWT: !!window._jwt_current,
+      currentUrl: location.href,
+      cookieCount: document.cookie.split(';').filter(c => c.trim()).length,
+      documentCookie: (document.cookie || '').substring(0, 100) + '...'
+    };
+  } catch (e) {
+    return { error: e.message };
+  }
+}
+""")
+
                 # 更寬鬆的登入檢測條件
                 has_cookies = len(all_cookies) > 0
-                has_tokens = auth_status.get('hasLocalToken') or auth_status.get('hasSessionToken') or auth_status.get('hasJWT')
-                has_auth_cookies = auth_status.get('cookieCount', 0) > 0
-                
+                has_tokens = auth_status.get("hasLocalToken") or auth_status.get("hasSessionToken") or auth_status.get("hasJWT")
+                has_auth_cookies = auth_status.get("cookieCount", 0) > 0
+
                 if has_cookies or has_tokens or has_auth_cookies:
                     domains = sorted({c.get("domain", "unknown") for c in all_cookies})
-                    logger.info(f"Detected login state:")
+                    logger.info("Detected login state:")
                     logger.info(f"  - Cookies: {len(all_cookies)} from domains: {domains}")
                     logger.info(f"  - Local token: {auth_status.get('hasLocalToken')}")
                     logger.info(f"  - Session token: {auth_status.get('hasSessionToken')}")
@@ -417,76 +403,43 @@ class ExistingBrowserMonitor:
                     logger.info(f"  - Document cookies: {auth_status.get('cookieCount')}")
                     logger.info("Login detected, proceeding with monitor setup.")
                     break
-                    
-                if i % 10 == 0:  # 每10秒提示一次
+
+                if i % 10 == 0:
+                    # 每10秒提示一次
                     logger.warning(f"No login detected yet (attempt {i+1}/{timeout}) — please complete login in the Chrome window.")
                     logger.debug(f"Current URL: {auth_status.get('currentUrl')}")
-                    
                 await asyncio.sleep(1)
             else:
                 logger.error("Timed out waiting for login; still not logged in after 5 minutes.")
                 logger.error("Please ensure you complete the full login process in the Chrome debug window.")
                 return False
-            
-            # 1C) 回应监听：只要任何 XHR/Fetch 的 JSON 回传带到 token，就即时更新
-            async def _jwt_hot_update_from_response(response):
-                try:
-                    req = response.request
-                    # 只看 XHR / fetch
-                    if getattr(req, "resource_type", None) not in ("xhr", "fetch"):
-                        return
-                    ct = (response.headers or {}).get("content-type", "")
-                    if "application/json" not in ct:
-                        return
-                    data = await response.json()
-                    cand = (data.get("access_token")
-                            or (data.get("data") or {}).get("access_token")
-                            or data.get("token"))
-                    if cand:
-                        await page.evaluate(
-                            """(t) => {
-                               window._jwt_current = t;
-                               try { localStorage.setItem('access_token', t); } catch {}
-                               try { sessionStorage.setItem('access_token', t); } catch {}
-                               console.debug('[JWT] updated via response hook');
-                             }""",
-                            cand
-                        )
-                        # 重置连续101计数
-                        self.consecutive_101_count = 0
-                except Exception:
-                    pass
 
-            page.on("response", _jwt_hot_update_from_response)
-            
-            # 1C+) 捕獲真實頁面請求模板（放寬條件）
+            # 捕獲真實頁面請求模板（放寬條件；僅做參考，不依賴它抓數據）
             async def _capture_template(request):
                 try:
                     url = request.url
                     if "t9live3.vip/api" not in url:
                         return
-                    # 關鍵詞同時命中 'result' 與 'search'（或 'list'）
                     low = url.lower()
                     if not (("result" in low) and ("search" in low or "list" in low)):
                         return
-
-                    body = await request.post_data() if request.method in ("POST","PUT","PATCH") else ""
+                    body = await request.post_data() if request.method in ("POST", "PUT", "PATCH") else ""
                     if request.method == "POST" and not body:
-                        return  # 不覆蓋
+                        return  # 不覆蓋空 body
                     self.req_template = {
                         "method": request.method,
                         "url": url,
                         "headers": dict(request.headers),
-                        "body": body or ""
+                        "body": body or "",
                     }
-                    await page.evaluate("window.__req_template__ = arguments[0]", self.req_template)
+                    await page.evaluate("(tpl) => { window.__req_template__ = tpl; }", self.req_template)
                     logger.info(f"[TEMPLATE] captured {request.method} {url} (len(body)={len(body)})")
                 except Exception as e:
                     logger.debug(f"Template capture error: {e}")
-            
-            page.on("request", _capture_template)
-            
-            # 1D) XHR/Fetch 鏡射：遇到 /api/game/result/search 的 JSON 就送進處理管線
+
+            self.page.on("request", _capture_template)
+
+            # XHR/Fetch 鏡射：遇到 /api/game/result/search 的 JSON 就送進處理管線
             async def _mirror_results(response):
                 try:
                     req = response.request
@@ -498,91 +451,42 @@ class ExistingBrowserMonitor:
                         return
                     if "application/json" not in (response.headers or {}).get("content-type", ""):
                         return
+
                     # Add DOM stability wait
                     await asyncio.sleep(0.6)  # 600ms wait for DOM to stabilize
 
                     data = await response.json()
+
                     # 提取記錄並處理
                     records = self.extract_records(data)
                     if records:
-                        # === 掃描全部100筆，準備 upsert 數據 ===
-                        all_records = records[:100]  # 確保掃描全部100筆
-
-                        # 防抖檢查：如果第一筆的局號沒變，跳過這次處理
-                        if all_records:
-                            first_round = all_records[0].get("round_id") or all_records[0].get("roundId")
-                            if first_round == self.last_first_round:
-                                self.skip_count += 1
-                                if self.skip_count <= 2:  # 容許連續 2 次相同
-                                    logger.debug(f"[UPSERT] Same first round {first_round}, skipping ({self.skip_count})")
-                                    return
-                            else:
-                                self.last_first_round = first_round
-                                self.skip_count = 0
-
-                        # 更新當前掃描結果 + 自動追蹤待回填
-                        self.update_scan_results(all_records)
-
-                        # 執行滑動帶回填檢查
-                        backfilled_records = self.sliding_band_backfill()
-
-                        # 合併所有記錄並發送完整快照用於 upsert
-                        all_to_send = []
-                        seen_keys = set()
-
-                        # 包含所有記錄（新的 + 回填的），後端會進行 upsert
-                        for record in all_records + backfilled_records:
-                            table_id = record.get("table_id") or record.get("tableId") or record.get("table")
-                            round_id = record.get("round_id") or record.get("roundId")
-                            if table_id and round_id:
-                                key = f"{table_id}:{round_id}"
-                                if key not in seen_keys:
-                                    all_to_send.append(record)
-                                    seen_keys.add(key)
-
-                        if all_to_send:
-                            logger.info(f"[UPSERT] sending {len(all_to_send)} records for upsert processing")
-                            success = await self.send_to_ingest(all_to_send)
+                        # Upsert：同一局狀態變了才送，新增也送；沒變就不送
+                        upserts = self._upsert_changes(records)
+                        if upserts:
+                            logger.info(f"[MIRROR] upserts {len(upserts)} record(s)")
+                            success = await self.send_to_ingest(upserts)
                             if success:
-                                self.stats["records_processed"] += len(all_to_send)
+                                self.stats["records_processed"] += len(upserts)
                 except Exception as e:
                     logger.debug(f"Mirror error: {e}")
 
-            page.on("response", _mirror_results)
-            
-            # 1E) WebSocket 鏡射（若站點有）：監聽 BrowserContext 的 websocket
-            def _on_ws(ws):
-                logger.info(f"[WS] connected: {ws.url}")
-                def on_rx(payload):
-                    try:
-                        # 很多站會用 JSON；如果是文字就先判斷再 json.loads
-                        logger.debug(f"[WS RX] {payload[:200] if len(payload) > 200 else payload}")
-                        # TODO: 依實際格式解析和處理 WebSocket 數據
-                    except Exception:
-                        pass
-                ws.on("framereceived", on_rx)
+            self.page.on("response", _mirror_results)
 
-            ctx.on("websocket", _on_ws)
-            
-            # 2) 更新的 API 请求拦截器：僅對 API 網域加 Authorization，且每次現讀
-            API_HOSTS = ("i.t9live3.vip", "i.t9live3.vip:443")
-            API_PATH_PREFIXES = ("/api/",)
-            
+            # API 请求拦截器：改為只攔截明確標記為測試的請求，讓軟刷新正常工作
             async def _with_cookie_and_bearer(route, request):
                 try:
-                    # 🛑 在軟刷新模式下，任何帶 X-Monitor: 1 的請求都是舊 poller 打的，直接擋掉
-                    if request.headers.get("x-monitor") == "1":
-                        logger.info("[BLOCK] Dropping leftover in-page poller request")
+                    # 只攔截明確標記為測試的請求，不攔截正常的 X-Monitor 請求
+                    if request.headers.get("x-test-block") == "1":
+                        logger.info("[BLOCK] Dropping test request")
                         await route.abort()
                         return
-
-                    # 其餘請求照常放行（不再主動加 Authorization 之類）
+                    # 其餘請求照常放行，包括帶 X-Monitor 的請求
                     await route.continue_()
                 except Exception:
                     await route.continue_()
-            
-            await page.route("**/*", _with_cookie_and_bearer)
-            
+
+            await self.page.route("**/*", _with_cookie_and_bearer)
+
             # 印出所有 4xx/5xx，找出一直 500 的真實 URL
             async def _resp_tracer(response):
                 try:
@@ -590,7 +494,6 @@ class ExistingBrowserMonitor:
                     if status and status >= 400:
                         req = response.request
                         logger.warning(f"[HTTP {status}] {req.method} {response.url}")
-                        # 若是我們關心的 JSON，就印出前段文字協助定位
                         ct = (response.headers or {}).get("content-type", "")
                         if "application/json" in ct:
                             try:
@@ -601,186 +504,75 @@ class ExistingBrowserMonitor:
                 except Exception:
                     pass
 
-            page.on("response", _resp_tracer)
-            
+            self.page.on("response", _resp_tracer)
+
             # 把頁面 console 打到你的日誌（方便觀察輪詢是否真的在跑）
-            page.on("console", lambda msg: logger.info(f"[PAGE:{msg.type}] {msg.text}"))
-            
+            self.page.on("console", lambda msg: logger.info(f"[PAGE:{msg.type}] {msg.text}"))
+
             # 检查页面状态
             page_info = await self.page.evaluate("""
-            () => {
-                try {
-                    return {
-                        url: window.location.href,
-                        title: document.title,
-                        hasJWT: !!(window._jwt_current || localStorage.getItem('access_token') || sessionStorage.getItem('access_token')),
-                        jwtPreview: (window._jwt_current || localStorage.getItem('access_token') || sessionStorage.getItem('access_token') || '').substring(0, 20)
-                    };
-                } catch (e) {
-                    return { error: e.message };
-                }
-            }
-            """)
-            
-            logger.info(f"Page Status:")
+() => {
+  try {
+    const tok = (window._jwt_current || localStorage.getItem('access_token') || sessionStorage.getItem('access_token') || '');
+    return {
+      url: window.location.href,
+      title: document.title,
+      hasJWT: !!tok,
+      jwtPreview: (tok || '').substring(0, 20)
+    };
+  } catch (e) {
+    return { error: e.message };
+  }
+}
+""")
+            logger.info("Page Status:")
             logger.info(f"  URL: {page_info.get('url')}")
             logger.info(f"  Title: {page_info.get('title')}")
             logger.info(f"  Has JWT: {page_info.get('hasJWT')}")
             logger.info(f"  JWT Preview: {page_info.get('jwtPreview')}")
             logger.info(f"  HttpOnly Cookies: {len(all_cookies)}")
-            
+
             # 小檢查（避免「看起來登入但其實沒 Cookie」）
             t9_cookies = await ctx.cookies("https://i.t9live3.vip")
             logger.info(f"T9 cookies: {len(t9_cookies)}")
-            
-            if not page_info.get('hasJWT'):
-                logger.warning("No JWT found in page - you may need to login first")
-                logger.info("Please login in your browser, then restart this monitor")
-                return False
-            
+
+            # 更寬鬆的認證檢測 - 如果在正確頁面就繼續
+            if not page_info.get("hasJWT"):
+                logger.warning("No JWT found in localStorage/sessionStorage")
+
+                # 檢查是否有 T9 cookies 或在正確的頁面
+                if len(t9_cookies) > 0 or "gameResult" in page_info.get('url', ''):
+                    logger.info("Found T9 cookies or on correct page - proceeding anyway")
+                else:
+                    logger.info("Please login in your browser, then restart this monitor")
+                    return False
+
             logger.info("Successfully connected to existing browser session")
             return True
-            
+
         except Exception as e:
             logger.error(f"Failed to connect to existing browser: {e}")
             return False
-    
-    async def make_api_request(self) -> Optional[Dict[str, Any]]:
-        """在现有页面中发送 API 请求"""
-        try:
-            if not self.page:
-                return {"_err": "NO_PAGE"}
-            
-            # 生成时间范围
-            now = datetime.datetime.now()
-            start_time = (now - datetime.timedelta(minutes=LOOKBACK_MINUTES)).strftime("%Y-%m-%d %H:%M:%S")
-            end_time = now.strftime("%Y-%m-%d %H:%M:%S")
-            
-            # 3) 更新的頁面評估：每次現讀 window._jwt_current
-            api_result = await self.page.evaluate(f"""
-            async () => {{
-              // 每次「現讀」最新 token
-              const jwt = (typeof window._jwt_current === 'string' && window._jwt_current) ? window._jwt_current : '';
-            
-              if (!jwt) return {{ error: 'No JWT in page' }};
-            
-              const buildHeaders = () => ({{ 
-                'Content-Type': 'application/json;charset=UTF-8',
-                'Accept': 'application/json, text/plain, */*',
-                'X-Requested-With': 'XMLHttpRequest',
-                'Authorization': 'Bearer ' + jwt
-              }});
-            
-              const payload = {{
-                game_code: 'baccarat',
-                startTime: "{start_time}",
-                endTime: "{end_time}",
-                page: 1,
-                pageNum: 1,
-                limit: {BATCH_SIZE},
-                pageSize: {BATCH_SIZE},
-                rowsCount: {BATCH_SIZE}
-              }};
-            
-              let res = await fetch('https://i.t9live3.vip/api/game/result/search', {{
-                method: 'POST',
-                headers: buildHeaders(),
-                credentials: 'include',
-                cache: 'no-store',
-                body: JSON.stringify(payload)
-              }});
 
-              // HTTP 500 重試機制（最多 3 次）
-              let http500_retries = 0;
-              while (res.status === 500 && http500_retries < 3) {{
-                http500_retries++;
-                const retryDelay = 1000 + (http500_retries * 500); // 1s, 1.5s, 2s
-                console.debug(`[HTTP 500] Retry ${{http500_retries}}/3 after ${{retryDelay}}ms`);
-                await new Promise(r => setTimeout(r, retryDelay));
-
-                res = await fetch('https://i.t9live3.vip/api/game/result/search', {{
-                  method: 'POST',
-                  headers: buildHeaders(),
-                  credentials: 'include',
-                  cache: 'no-store',
-                  body: JSON.stringify(payload)
-                }});
-              }}
-
-              // 202 正規輪詢（最多 5 次）
-              let tries = 0;
-              while (res.status === 202 && tries < 5) {{
-                const ra = parseInt(res.headers.get('Retry-After') || '0', 10);
-                const loc = res.headers.get('Location');
-                const waitMs = ra > 0 ? ra*1000 : (900 + Math.random()*600);
-                await new Promise(r => setTimeout(r, waitMs));
-                res = await fetch(loc || 'https://i.t9live3.vip/api/game/result/search', {{
-                  method: 'GET',
-                  headers: buildHeaders(),
-                  credentials: 'include',
-                  cache: 'no-store'
-                }});
-                tries++;
-              }}
-
-              let data = {{}};
-              try {{ data = await res.json(); }} catch {{}}
-              return {{ success: res.ok, status: res.status, data, jwt_used: jwt.substring(0, 20), http500_retries }};
-            }}
-            """)
-            
-            self.stats["total_requests"] += 1
-            
-            if api_result.get("success") and api_result.get("status") == 200:
-                data = api_result.get("data", {})
-                code = data.get("code")
-                
-                logger.debug(f"API Response: status={api_result.get('status')}, code={code}")
-                
-                if code == 200:
-                    self.stats["successful_requests"] += 1
-                    return data
-                elif code == 202:
-                    logger.debug("Request queued (202)")
-                    return None
-                elif code == 101:
-                    logger.warning("JWT expired or session invalid (101 error)")
-                    self.stats["failed_requests"] += 1
-                    return {"_err": "CODE_101"}
-                else:
-                    logger.warning(f"Unexpected response code: {code}")
-                    self.stats["failed_requests"] += 1
-                    return None
-            else:
-                error_msg = api_result.get("error", "Unknown error")
-                logger.warning(f"API request failed: {error_msg}")
-                self.stats["failed_requests"] += 1
-                return {"_err": "OTHER"}
-                
-        except Exception as e:
-            logger.error(f"API request error: {e}")
-            self.stats["failed_requests"] += 1
-            return {"_err": "EXCEPTION"}
-    
     def extract_records(self, data: Dict[str, Any]) -> List[Dict[str, Any]]:
         """从响应中提取记录"""
         try:
             if not isinstance(data, dict):
                 return []
 
-            records = []
+            records: List[Dict[str, Any]] = []
 
             # 尝试多种数据结构
-            if 'data' in data and isinstance(data['data'], dict):
-                d = data['data']
-                if isinstance(d.get('rows'), list):
-                    records = d['rows']
-                elif isinstance(d.get('list'), list):
-                    records = d['list']
-                elif isinstance(d.get('data'), list):
-                    records = d['data']
-            elif isinstance(data.get('data'), list):
-                records = data['data']
+            if "data" in data and isinstance(data["data"], dict):
+                d = data["data"]
+                if isinstance(d.get("rows"), list):
+                    records = d["rows"]
+                elif isinstance(d.get("list"), list):
+                    records = d["list"]
+                elif isinstance(d.get("data"), list):
+                    records = d["data"]
+                elif isinstance(data.get("data"), list):
+                    records = data["data"]
             else:
                 # 通用提取
                 for key in ("records", "items", "list", "result", "rows"):
@@ -796,52 +588,60 @@ class ExistingBrowserMonitor:
                 unstable_status_filtered = 0
 
                 for record in records:
-                    table_id = record.get('table_id', '')
-                    payment_status = record.get('game_payment_status')
-                    game_result = record.get('gameResult', {})
-                    result = game_result.get('result') if isinstance(game_result, dict) else None
+                    table_id = record.get("table_id", "")
+                    payment_status = record.get("game_payment_status")
+                    game_result = record.get("gameResult", {})
+                    result = game_result.get("result") if isinstance(game_result, dict) else None
 
                     # 過濾1: T9Blockchains桌台（取消率過高）
-                    if table_id.startswith('T9Blockchains_'):
+                    if isinstance(table_id, str) and table_id.startswith("T9Blockchains_"):
                         blockchain_filtered += 1
                         continue
 
-                    # 過濾2: payment_status=1且沒有最終結果的記錄（48%取消率）
-                    if payment_status == 1 and result not in [1, 2, 3]:  # 只保留有明確結果的status=1記錄
-                        unstable_status_filtered += 1
-                        continue
+                    # 調整過濾邏輯：只過濾真正沒有結果的進行中記錄
+                    # 如果 payment_status=1 但已經有明確結果(0,1,2,3)，仍然保留（可能是狀態更新延遲）
+                    # 注意：result=0 代表取消/無效，也是有效的最終結果，不應該被過濾
+                    if payment_status == 1 and result not in [0, 1, 2, 3]:
+                        # 進一步檢查是否真的沒有結果（避免過度過濾）
+                        status_text = str(record.get('status') or record.get('game_status') or '').lower()
+                        settle_status = str(record.get('settle_status') or '').lower()
+
+                        # 如果明確是進行中狀態且沒有結果，才過濾
+                        if any(word in status_text for word in ['進行', '開獎', 'running', 'progress']) or \
+                           any(word in settle_status for word in ['進行', 'pending', 'processing']):
+                            unstable_status_filtered += 1
+                            continue
 
                     filtered_records.append(record)
 
                 if blockchain_filtered > 0 or unstable_status_filtered > 0:
-                    logger.debug(f"Filtered out {blockchain_filtered} blockchain + {unstable_status_filtered} unstable status records")
-
+                    logger.debug(
+                        f"Filtered out {blockchain_filtered} blockchain + {unstable_status_filtered} unstable status records"
+                    )
                 return filtered_records
 
             return []
-
         except Exception as e:
             logger.error(f"Record extraction error: {e}")
             return []
-    
+
     async def send_to_ingest(self, records: List[Dict[str, Any]]) -> bool:
         """发送记录到 ingest API"""
-        
         try:
             import aiohttp
-            
+
             payload = {"records": records}
             headers = {
                 "X-INGEST-KEY": INGEST_KEY,
-                "Content-Type": "application/json"
+                "Content-Type": "application/json",
             }
-            
+
             async with aiohttp.ClientSession() as session:
                 async with session.post(
                     INGEST_URL,
                     json=payload,
                     headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=10)
+                    timeout=aiohttp.ClientTimeout(total=10),
                 ) as response:
                     if response.status == 200:
                         logger.info(f"Successfully sent {len(records)} records to ingest")
@@ -850,239 +650,165 @@ class ExistingBrowserMonitor:
                         error_text = await response.text()
                         logger.error(f"Ingest API error {response.status}: {error_text}")
                         return False
-                        
         except Exception as e:
             logger.error(f"Ingest error: {e}")
             return False
-    
-    async def monitor_loop(self):
-        """主监控循环"""
-        logger.info("Starting monitor loop...")
-        
-        while self.is_running:
-            try:
-                if not ACTIVE_PULL:
-                    await asyncio.sleep(POLL_INTERVAL + random.uniform(0.2, 0.6))
-                    continue
-                
-                # 发送 API 请求
-                data = await self.make_api_request()
-                
-                if data and not data.get("_err"):
-                    # 重置连续101计数
-                    self.consecutive_101_count = 0
-                    
-                    # 提取记录
-                    records = self.extract_records(data)
-                    
-                    if records:
-                        # 发送到 ingest
-                        success = await self.send_to_ingest(records)
-                        if success:
-                            self.stats["records_processed"] += len(records)
-                            logger.info(f"Processed {len(records)} records")
-                elif data and data.get("_err") == "CODE_101":
-                    # 只對真正的101錯誤進行自癒
-                    await self._handle_consecutive_failures()
-                else:
-                    # 其他錯誤只記log，不進行101自癒
-                    if data:
-                        logger.debug(f"API error: {data.get('_err')}")
-                
-                # 4) 小防呆: 轮询抖动，避免固定节律
-                await asyncio.sleep(POLL_INTERVAL + random.uniform(0.2, 0.6))
-                
-            except Exception as e:
-                logger.error(f"Monitor loop error: {e}")
-                await asyncio.sleep(5)
-    
-    async def lookup_round_in_page(self, round_id: str) -> bool:
-        """使用頁面 UI 精準搜索特定局號"""
-        try:
-            page = self.page
-            if not page:
-                return False
 
-            logger.debug(f"[BACKFILL] Looking up round {round_id}")
-
-            # 1) 尋找「局號」輸入框（多種可能的選擇器）
-            input_box = None
-            try:
-                # 嘗試不同的選擇器
-                selectors = [
-                    'input[placeholder*="局"]',
-                    'input[placeholder*="round"]',
-                    'input[placeholder*="Round"]',
-                    '.el-input input[placeholder*="局"]',
-                    '.ant-input[placeholder*="局"]',
-                    'input[name*="round"]'
-                ]
-
-                for selector in selectors:
-                    elements = await page.query_selector_all(selector)
-                    if elements:
-                        input_box = elements[0]
-                        logger.debug(f"[BACKFILL] Found input box with selector: {selector}")
-                        break
-
-                if not input_box:
-                    logger.debug("[BACKFILL] No round input box found")
-                    return False
-
-            except Exception as e:
-                logger.debug(f"[BACKFILL] Input box search error: {e}")
-                return False
-
-            # 2) 尋找搜索按鈕
-            search_btn = None
-            try:
-                btn_selectors = [
-                    'button:has-text("檢索")',
-                    'button:has-text("搜索")',
-                    'button:has-text("查詢")',
-                    'button:has-text("查询")',
-                    '.el-button:has-text("檢索")',
-                    '.ant-btn:has-text("搜索")'
-                ]
-
-                for selector in btn_selectors:
-                    try:
-                        search_btn = await page.query_selector(selector)
-                        if search_btn:
-                            logger.debug(f"[BACKFILL] Found search button with selector: {selector}")
-                            break
-                    except:
-                        continue
-
-                if not search_btn:
-                    logger.debug("[BACKFILL] No search button found")
-                    return False
-
-            except Exception as e:
-                logger.debug(f"[BACKFILL] Search button error: {e}")
-                return False
-
-            # 3) 輸入局號並點擊搜索
-            await input_box.clear()
-            await input_box.fill(str(round_id))
-            await asyncio.sleep(0.5)  # 短暫等待
-
-            await search_btn.click()
-            await asyncio.sleep(1.5)  # 等待搜索結果
-
-            # 4) 檢查搜索結果
-            try:
-                # 尋找結果表格
-                table_rows = await page.query_selector_all("table tbody tr")
-                if not table_rows:
-                    logger.debug(f"[BACKFILL] No results found for round {round_id}")
-                    return False
-
-                # 檢查第一行是否包含目標局號
-                first_row = table_rows[0]
-                row_text = await first_row.inner_text()
-
-                if str(round_id) in row_text:
-                    logger.debug(f"[BACKFILL] Found target round in results: {round_id}")
-
-                    # 5) 解析並發送這條記錄
-                    # 這裡需要根據實際頁面結構解析
-                    # 簡化版本：觸發現有的鏡射機制來處理結果
-                    await asyncio.sleep(0.5)  # 讓鏡射有時間捕獲
-                    return True
-                else:
-                    logger.debug(f"[BACKFILL] Round {round_id} not found in results")
-                    return False
-
-            except Exception as e:
-                logger.debug(f"[BACKFILL] Result parsing error: {e}")
-                return False
-
-        except Exception as e:
-            logger.debug(f"[BACKFILL] Lookup error for round {round_id}: {e}")
-            return False
-
-    async def discover_and_arm_template(self, timeout_ms: int = 20000):
+    async def discover_and_arm_template(self, timeout_ms: int = 20000) -> bool:
+        """發現並武裝請求模板（同時點一下「搜索/檢索」）"""
         page = self.page
         context = self.browser.contexts[0]
 
-        # 1) 寬鬆監聽：收集 t9live3.vip 的 XHR/Fetch（不限關鍵字）
+        # 寬鬆監聽：收集 t9live3.vip 的 XHR/Fetch（不限關鍵字）
         hits = []
 
         def _collector(req):
             try:
                 if req.resource_type in ("xhr", "fetch") and "t9live3.vip" in req.url:
                     hits.append(req)
-            except:
+            except Exception:
                 pass
 
         context.on("request", _collector)
 
-        # 2) 可靠點擊「搜索」：多語系/多元素型態
+        # 更強化的點擊「搜索/檢索」邏輯
         clicked = await page.evaluate("""
-        (() => {
-          const cand = Array.from(document.querySelectorAll(
-            'button, input[type="button"], a[role="button"], .el-button'
-          ));
-          const txt = (el) => (el.innerText || el.value || '').trim();
-          const hit = cand.find(b => /搜索|查询|搜尋|查詢|检索|檢索/.test(txt(b)));
-          if (hit) { hit.click(); return true; }
-          return false;
-        })();
-        """)
+(() => {
+  // 更廣泛的選擇器，包括可能的 Vue/Element UI 組件
+  const selectors = [
+    'button, input[type="button"], a[role="button"]',
+    '.el-button, .el-button--primary, .el-button--default',
+    '[class*="btn"], [class*="button"]',
+    'span[role="button"], div[role="button"]',
+    '*[onclick*="search"], *[onclick*="query"]'
+  ];
+
+  let allCandidates = [];
+  for (const sel of selectors) {
+    try {
+      allCandidates.push(...document.querySelectorAll(sel));
+    } catch(e) {}
+  }
+
+  const txt = (el) => {
+    const text = (el.innerText || el.textContent || el.value || '').trim();
+    const title = (el.title || el.getAttribute('title') || '').trim();
+    const ariaLabel = (el.getAttribute('aria-label') || '').trim();
+    return [text, title, ariaLabel].join(' ').toLowerCase();
+  };
+
+  // 尋找包含搜索相關文字的元素
+  const searchTerms = ['搜索', '查询', '搜尋', '查詢', '检索', '檢索', 'search', 'query', '搜', '查'];
+  const hit = allCandidates.find(el => {
+    const elementText = txt(el);
+    return searchTerms.some(term => elementText.includes(term.toLowerCase()));
+  });
+
+  if (hit) {
+    console.log('Found search button:', hit.outerHTML.substring(0, 100));
+    // 嘗試多種點擊方式
+    try {
+      hit.click();
+      return true;
+    } catch(e1) {
+      try {
+        hit.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true}));
+        return true;
+      } catch(e2) {
+        try {
+          // 如果是 Vue 組件，嘗試觸發事件
+          hit.dispatchEvent(new Event('click', {bubbles: true}));
+          return true;
+        } catch(e3) {
+          console.log('All click methods failed:', e1, e2, e3);
+        }
+      }
+    }
+  }
+
+  // 備案：嘗試找到並提交表單
+  try {
+    const forms = document.querySelectorAll('form');
+    for (const form of forms) {
+      if (form.querySelector('input, button')) {
+        form.dispatchEvent(new Event('submit', {bubbles: true, cancelable: true}));
+        console.log('Submitted form as fallback');
+        return true;
+      }
+    }
+  } catch(e) {}
+
+  // 最後手段：按 Enter 鍵
+  try {
+    document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', bubbles: true}));
+    console.log('Triggered Enter key as last resort');
+    return true;
+  } catch(e) {}
+
+  console.log('No search button found. Available buttons:',
+    allCandidates.slice(0, 5).map(el => el.outerHTML.substring(0, 50))
+  );
+  return false;
+})()
+""")
+
         if not clicked:
             # 聚焦頁面按 Enter，萬一這頁支持鍵盤提交
             try:
                 await page.keyboard.press("Enter")
-            except:
+            except Exception:
                 pass
 
-        # 3) 在時間窗內輪詢查看是否有命中的請求
+        # 在時間窗內輪詢查看是否有命中的請求
         deadline = time.time() + (timeout_ms / 1000.0)
         picked = None
         while time.time() < deadline:
-            # 優先挑 /api/ 且 URL 含 result/search/list/round/game 的
-            prefer = [r for r in hits if ("/api/" in r.url.lower() and any(k in r.url.lower() for k in ("result","search","list","round","game")))]
+            prefer = [
+                r
+                for r in hits
+                if ("/api/" in r.url.lower() and any(k in r.url.lower() for k in ("result", "search", "list", "round", "game")))
+            ]
             picked = prefer[0] if prefer else (hits[0] if hits else None)
             if picked:
                 break
             await asyncio.sleep(0.2)
 
-        # 4) 停止收集
+        # 停止收集
         try:
             context.off("request", _collector)
-        except:
+        except Exception:
             pass
 
         if not picked:
-            raise TimeoutError("no XHR/fetch captured after clicking search")
+            logger.warning("discover_and_arm_template: no XHR/fetch captured after clicking search")
+            return False
 
-        # 5) 取出模板（method/url/headers/body）
+        # 取出模板（method/url/headers/body）
         body = ""
         try:
-            if picked.method in ("POST","PUT","PATCH"):
+            if picked.method in ("POST", "PUT", "PATCH"):
                 body = await picked.post_data() or ""
-        except:
+        except Exception:
             pass
 
         self.req_template = {
             "method": picked.method,
             "url": picked.url,
             "headers": dict(picked.headers),
-            "body": body
+            "body": body,
         }
         logger.info(f"[TEMPLATE] {picked.method} {picked.url} captured (len(body)={len(body)})")
-        await page.evaluate("window.__req_template__ = arguments[0]", self.req_template)
+        await self.page.evaluate("(tpl) => { window.__req_template__ = tpl; }", self.req_template)
         return True
 
     async def start_poller(self, interval_ms: int = 1000):
         """
-        在「頁面內」每 ~1 秒打一次 /api/game/result/search，
-        現讀 JWT、處理 202/ETag，且只把「新資料」送進 ingest。
+        在「頁面內」每 ~1 秒打一次 /api/game/result/search（如果未被攔截）；
+        目前我們用路由把 X-Monitor:1 的請求擋掉，所以主要數據仍靠鏡射。
         """
         page = self.page
 
-        # 讓頁面可以把新資料回呼回來
+        # 讓頁面可以把新資料回呼回來（如果你日後要開啟 poller）
         async def _ingest_results(items):
             try:
                 if not items:
@@ -1101,151 +827,168 @@ class ExistingBrowserMonitor:
 (() => {
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
   const jitter = (b, j=300) => b + Math.floor(Math.random()*j);
-  const pad = (n)=> (n<10?'0':'')+n;
-  const ts = (d)=> `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
-  // 改進的去重鍵邏輯 - 適配站方回傳的真實欄位
-  const idOf = r => r.round_id || r.roundId || r.merchant_round_id || r.id || null;
-  const tableOf = r => r.table_id || r.tableId || r.table_code || r.table || r['台號'] || null;
-  const startOf = r => r.game_start_time || r.openTime || r.start_time || r['開局時間'] || null;
 
+  function pad(n){ return n < 10 ? '0' + n : String(n); }
+  function ts(d){
+    return d.getFullYear() + '-' + pad(d.getMonth()+1) + '-' + pad(d.getDate())
+      + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
+  }
+
+  // 改進的去重鍵邏輯 - 適配站方回傳的真實欄位
+  const idOf = r => r?.round_id || r?.roundId || r?.merchant_round_id || r?.id || null;
+  const tableOf = r => r?.table_id || r?.tableId || r?.table_code || r?.table || r?.['台號'] || null;
+  const startOf = r => r?.game_start_time || r?.openTime || r?.start_time || r?.['開局時間'] || null;
   const uniqId = r => {
     const rid = idOf(r);
     if (rid) return String(rid);
     const t = tableOf(r), s = startOf(r);
-    return (t && s) ? `${t}@${s}` : null;
+    return (t && s) ? (t + '@' + s) : null;
   };
 
   // 初始化模板變數
   window.__req_template__ = window.__req_template__ || null;
-  
-  // ✅ 添加強制立即執行一次的入口
+
+  // 添加強制立即執行一次的入口
   window.__poller_force_now__ = () => { window.__poller_force_flag__ = true; };
-  
+
   window.__result_poller__ = async (opts) => {
     const state = { etag: null, seen: new Set(), consecutiveFails: 0 };
-    let lastMaxRound = 0; // 只處理比它新的 round_id
-    const url = opts.url || 'https://i.t9live3.vip/api/game/result/search';
-    const baseInterval = opts.interval_ms || 1000;
+    let lastRoundIdByTable = new Map(); // 改成每桌獨立追蹤最新 round_id
+    let lookbackMinutesByTable = new Map(); // 每桌的動態回看時間（分鐘）
+
+    const url = (opts && opts.url) || 'https://i.t9live3.vip/api/game/result/search';
+    const baseInterval = (opts && opts.interval_ms) || 1000;
+    const pageSize = (opts && opts.batch_size) || 100;
+    const defaultLookbackMinutes = 2; // 預設回看2分鐘
 
     console.debug('[POLLER] Starting in-page poller with interval:', baseInterval);
 
     while (true) {
       try {
-        // ✅ 檢查是否需要強制立即執行
+        // 檢查停止標記
+        if (window.__stop_poller__) {
+          console.debug('[POLLER] Stop flag detected, exiting poller');
+          break;
+        }
+
         if (window.__poller_force_flag__) {
           window.__poller_force_flag__ = false;
           console.debug('[POLLER] Force trigger activated');
         }
 
-        // 這裡每輪都算出時間窗
+        // 每輪都算出時間窗（動態回看時間）
         const now = new Date();
-        const pad = (n)=> (n<10?'0':'')+n;
-        const ts = (d)=> `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
         const endTime = ts(now);
-        const startTime = ts(new Date(now.getTime() - {LOOKBACK_MINUTES}*60*1000)); // 近 {LOOKBACK_MINUTES} 分鐘
+        // 使用平均動態回看時間，若無資料則用預設值
+        let avgLookbackMinutes = defaultLookbackMinutes;
+        if (lookbackMinutesByTable.size > 0) {
+          const totalMinutes = Array.from(lookbackMinutesByTable.values()).reduce((a, b) => a + b, 0);
+          avgLookbackMinutes = Math.max(defaultLookbackMinutes, totalMinutes / lookbackMinutesByTable.size);
+        }
+        const startTime = ts(new Date(now.getTime() - avgLookbackMinutes * 60 * 1000));
 
-        const token = (window._jwt_current
-                       || localStorage.getItem('access_token')
-                       || sessionStorage.getItem('access_token')
-                       || '').toString();
+        const token = (window._jwt_current || localStorage.getItem('access_token') || sessionStorage.getItem('access_token') || '').toString();
         let resp;
 
         if (window.__req_template__) {
+          // 使用模板（若有）
           const t = window.__req_template__;
           const h = new Headers(t.headers || {});
-          h.set('X-Monitor','1');                                   // 只讓我們的攔截器處理
+          h.set('X-Monitor','1'); // 標記為監控請求，但不再被攔截
           if (token) h.set('Authorization','Bearer '+token);
           h.set('Accept','application/json, text/plain, */*');
 
           const method = (t.method || 'POST').toUpperCase();
-          const opts = { method, headers: h, credentials:'include', cache:'no-store' };
-
+          const opts2 = { method, headers: h, credentials:'include', cache:'no-store' };
           let body = t.body || '';
-          // ① 無論 GET/POST，一律把 URL 上的查詢參數換成最新時間窗
+
+          // 更新 URL 查詢參數
           const urlObj = new URL(t.url, location.origin);
           const sp = urlObj.searchParams;
-          // 先清後設（避免重複/殘留）
-          ['startTime','endTime','page','pageIndex','pageSize','limit','rowsCount']
-            .forEach(k => { if (sp.has(k)) sp.delete(k) });
+          ['startTime','endTime','page','pageIndex','pageSize','limit','rowsCount'].forEach(k => { if (sp.has(k)) sp.delete(k); });
           sp.set('startTime', startTime);
           sp.set('endTime',   endTime);
           sp.set('pageIndex', '1');
-          sp.set('pageSize',  '{BATCH_SIZE}');
+          sp.set('pageSize', String(pageSize));
           const targetUrl = urlObj.toString();
 
+          // 嘗試更新 body 的時間窗
           try {
-            // JSON body
             const obj = JSON.parse(body);
             obj.startTime = startTime;
-            obj.endTime = endTime;
+            obj.endTime   = endTime;
             if ('pageIndex' in obj) obj.pageIndex = 1;
-            if ('pageSize'  in obj) obj.pageSize  = {BATCH_SIZE};
+            if ('pageSize'  in obj) obj.pageSize  = pageSize;
             body = JSON.stringify(obj);
-            h.set('Content-Type', h.get('Content-Type') || 'application/json;charset=UTF-8');
+            if (!h.has('Content-Type')) h.set('Content-Type', 'application/json;charset=UTF-8');
           } catch {
-            // x-www-form-urlencoded
             try {
               const p = new URLSearchParams(body);
-              if (p.has('startTime')) p.set('startTime', startTime);
-              if (p.has('endTime'))   p.set('endTime',   endTime);
-              if (p.has('pageIndex')) p.set('pageIndex', '1');
-              if (p.has('pageSize'))  p.set('pageSize',  '{BATCH_SIZE}');
+              p.set('startTime', startTime);
+              p.set('endTime',   endTime);
+              p.set('pageIndex', '1');
+              p.set('pageSize',  String(pageSize));
               body = p.toString();
-              h.set('Content-Type', h.get('Content-Type') || 'application/x-www-form-urlencoded; charset=UTF-8');
+              if (!h.has('Content-Type')) h.set('Content-Type','application/x-www-form-urlencoded; charset=UTF-8');
             } catch {}
           }
 
-          if (method !== 'GET') opts.body = body;
-          // ② 一律以改好的 targetUrl 發請求（GET/POST 都能用）
-          resp = await fetch(targetUrl, opts);
+          if (method !== 'GET') opts2.body = body;
+
+          resp = await fetch(targetUrl, opts2);
           console.debug('[POLLER] used template', method, targetUrl, '→', resp.status);
         } else {
+          // 預設 payload
           const body = {
-            // 站方常用欄位，盡量齊
             startTime, endTime,
-            game_code: 'baccarat',   // 若不需要也無妨；後端會忽略
+            game_code: 'baccarat',
             page: 1, pageNum: 1, pageIndex: 1,
-            pageSize: {BATCH_SIZE}, limit: {BATCH_SIZE}, rowsCount: {BATCH_SIZE}
+            pageSize: pageSize, limit: pageSize, rowsCount: pageSize
           };
-          // HTTP 500 重試機制 for in-page poller
+
+          // HTTP 500 重試
           let http500_retries = 0;
           const maxRetries = 2;
-
           do {
-            resp = await fetch('https://i.t9live3.vip/api/game/result/search', {
+            resp = await fetch(url, {
               method:'POST',
-              headers:(()=>{const hh=new Headers({
-                'X-Monitor':'1',
-                'Accept':'application/json, text/plain, */*',
-                'Content-Type':'application/json;charset=UTF-8',
-                'X-Requested-With':'XMLHttpRequest'
-              }); if(token) hh.set('Authorization','Bearer '+token); return hh;})(),
-              credentials:'include', cache:'no-store',
+              headers:(()=>{
+                const hh = new Headers({
+                  'X-Monitor':'1',                 // 標記為監控請求，但不再被攔截
+                  'Accept':'application/json, text/plain, */*',
+                  'Content-Type':'application/json;charset=UTF-8',
+                  'X-Requested-With':'XMLHttpRequest'
+                });
+                if (token) hh.set('Authorization','Bearer '+token);
+                return hh;
+              })(),
+              credentials:'include',
+              cache:'no-store',
               body: JSON.stringify(body)
             });
-
             if (resp.status === 500 && http500_retries < maxRetries) {
               http500_retries++;
               const retryDelay = 800 + (http500_retries * 400); // 0.8s, 1.2s
-              console.debug(`[POLLER] HTTP 500 retry ${http500_retries}/${maxRetries} after ${retryDelay}ms`);
+              console.debug('[POLLER] HTTP 500 retry', http500_retries, '/', maxRetries, 'after', retryDelay, 'ms');
               await sleep(retryDelay);
             } else {
               break;
             }
           } while (http500_retries <= maxRetries);
 
-          console.debug('[POLLER] used default payload →', resp.status, http500_retries > 0 ? `(retries: ${http500_retries})` : '');
+          console.debug('[POLLER] used default payload →', resp.status);
         }
 
-        // 處理非OK狀態
+        // 非 OK 狀態處理
         if (!resp.ok) {
-          const txt = await resp.text().catch(() => '');
-          console.debug('[POLLER] HTTP', resp.status, txt.slice(0, 300));
+          try {
+            const txt = await resp.text();
+            console.debug('[POLLER] HTTP', resp.status, (txt || '').slice(0, 300));
+          } catch(e) {}
           state.consecutiveFails++;
-          
           if (state.consecutiveFails >= 3) {
             console.warn('[POLLER] Too many consecutive failures, pausing...');
-            await sleep(10000); // 暫停10秒
+            await sleep(10000);
             state.consecutiveFails = 0;
           }
           await sleep(jitter(baseInterval));
@@ -1274,304 +1017,465 @@ class ExistingBrowserMonitor:
         }
 
         state.etag = resp.headers.get('ETag') || state.etag;
-        const json = await resp.json();
-        
-        const biz = json?.code ?? json?.data?.code;
-        if (typeof biz !== 'undefined' && biz !== 200) {
-          console.debug('[POLLER] api code=', biz, 'msg=', json?.msg || json?.message);
-        }
-        const list =
-          (json?.data?.list) ||
-          (json?.data?.rows) ||
-          (json?.data?.data) ||   // 有些後端長這樣
-          json?.records ||        // 你的 /api/latest 就是這個 key
-          json?.list || [];
 
+        const json = await resp.json();
+        const biz = (json && (json.code ?? (json.data && json.data.code)));
+        if (typeof biz !== 'undefined' && biz !== 200) {
+          console.debug('[POLLER] api code=', biz, 'msg=', (json && (json.msg || json.message)));
+
+          // 處理業務邏輯中的 202 - 需要軟刷新（點擊檢索按鈕）
+          if (biz === 202) {
+            console.debug('[POLLER] Business code 202 detected, triggering soft refresh...');
+            try {
+              // 使用更強大的軟刷新邏輯（來自之前的實現）
+              const softRefreshSuccess = (() => {
+                const byText = (el) => (el.innerText || el.textContent || "").trim();
+
+                // 深度遍歷所有元素
+                const all = [];
+                const walk = (root) => {
+                  const iter = document.createNodeIterator(root, NodeFilter.SHOW_ELEMENT);
+                  for (let n = iter.nextNode(); n; n = iter.nextNode()) {
+                    all.push(n);
+                    if (n.shadowRoot) walk(n.shadowRoot);
+                  }
+                };
+                walk(document);
+
+                const click = (el, why) => {
+                  try {
+                    el.click?.();
+                    el.dispatchEvent?.(new MouseEvent('click', {bubbles:true, cancelable:true}));
+                    console.debug('[SOFT_REFRESH] Clicked:', why, '→', (byText(el) || el.className || el.id || el.tagName));
+                    return true;
+                  } catch (e) {
+                    console.debug('[SOFT_REFRESH] click failed:', e.message);
+                    return false;
+                  }
+                };
+
+                // 優先搜索正確的檢索按鈕 - 必須是純粹的"檢索"文字
+
+                // 1) 首先查找純粹的"檢索"按鈕（排除左側導航）
+                let searchButton = null;
+
+                for (const el of all) {
+                  // 必須是按鈕元素
+                  if (!el.matches?.('button,[role="button"],.el-button,.ant-btn,.btn')) continue;
+
+                  const text = byText(el);
+                  // 必須是純粹的"檢索"文字（繁體或簡體，不能包含其他文字）
+                  if (text !== '檢索' && text !== '检索') continue;
+
+                  // 檢查位置 - 排除左側區域的按鈕
+                  const rect = el.getBoundingClientRect?.();
+                  if (rect) {
+                    // 如果按鈕在頁面左側1/3區域，很可能是導航按鈕，跳過
+                    if (rect.left < window.innerWidth / 3) {
+                      console.debug('[SOFT_REFRESH] Skipping left-side button:', text, 'at x:', rect.left);
+                      continue;
+                    }
+                  }
+
+                  // 檢查父容器是否為導航相關
+                  let isNavButton = false;
+                  let parent = el.parentElement;
+                  let depth = 0;
+                  while (parent && depth < 10) {
+                    const parentClass = (parent.className || '').toLowerCase();
+                    const parentId = (parent.id || '').toLowerCase();
+                    const combined = parentClass + ' ' + parentId;
+
+                    // 更嚴格的導航檢查
+                    if (/sidebar|nav|menu|aside|left|drawer|collapse/.test(combined)) {
+                      isNavButton = true;
+                      console.debug('[SOFT_REFRESH] Found nav parent:', parentClass, parentId);
+                      break;
+                    }
+                    parent = parent.parentElement;
+                    depth++;
+                  }
+
+                  if (!isNavButton) {
+                    searchButton = el;
+                    console.debug('[SOFT_REFRESH] Found valid search button at x:', rect?.left || 'unknown');
+                    break;
+                  }
+                }
+
+                if (searchButton && click(searchButton, 'pureSearch')) return true;
+
+                // 2) 如果沒找到純粹的"檢索"，試試其他搜索關鍵詞（包含簡繁體）
+                const searchKeywords = /^(检索|檢索|搜索|搜尋|查詢|查询|Search)$/;
+
+                for (const el of all) {
+                  if (!el.matches?.('button,[role="button"],.el-button,.ant-btn,.btn')) continue;
+
+                  const text = byText(el);
+                  if (!searchKeywords.test(text)) continue;
+
+                  // 同樣的位置檢查
+                  const rect = el.getBoundingClientRect?.();
+                  if (rect && rect.left < window.innerWidth / 3) continue;
+
+                  // 排除導航按鈕
+                  let isNavButton = false;
+                  let parent = el.parentElement;
+                  let depth = 0;
+                  while (parent && depth < 10) {
+                    const parentClass = (parent.className || '').toLowerCase();
+                    const parentId = (parent.id || '').toLowerCase();
+                    if (/sidebar|nav|menu|aside|left|drawer/.test(parentClass + ' ' + parentId)) {
+                      isNavButton = true;
+                      break;
+                    }
+                    parent = parent.parentElement;
+                    depth++;
+                  }
+
+                  if (!isNavButton && click(el, 'altSearch')) return true;
+                }
+
+                // 3) 最後才按 class 尋找（但也要排除左側）
+                for (const el of all) {
+                  if (!el.matches?.('[class*="search"],[data-action*="search"],.el-button--primary')) continue;
+
+                  const rect = el.getBoundingClientRect?.();
+                  if (rect && rect.left < window.innerWidth / 3) continue;
+
+                  if (click(el, 'byClass')) return true;
+                }
+
+                // 3) 備案：按 Enter 鍵
+                try {
+                  document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', bubbles: true}));
+                  console.debug('[SOFT_REFRESH] Triggered Enter key');
+                  return true;
+                } catch(e) {}
+
+                return false;
+              })();
+
+              if (softRefreshSuccess) {
+                console.debug('[POLLER] Soft refresh triggered successfully');
+                // 等待軟刷新完成，然後強制觸發下一次輪詢
+                await sleep(2000);
+                if (typeof window.__poller_force_now__ === 'function') {
+                  window.__poller_force_now__();
+                  console.debug('[POLLER] Forced next poll after soft refresh');
+                }
+              } else {
+                console.debug('[POLLER] Soft refresh failed, no suitable button found');
+              }
+            } catch (e) {
+              console.debug('[POLLER] Soft refresh failed:', e);
+            }
+          }
+        }
+
+        const list = (json?.data?.list) || (json?.data?.rows) || (json?.data?.data) || json?.records || json?.list || [];
         const fresh = [];
+        const updates = []; // 用於存放已存在但狀態有變的記錄
+
+        // 維護進行中記錄的快取，用於回填機制
+        if (!state.pendingRounds) {
+          state.pendingRounds = new Map(); // key: uniqId, value: {record, lastSeen}
+        }
+
         for (const r of list) {
-          // 先檢查 round_id 是否夠新
-          const ridNum = Number(r.round_id || r.roundId || 0) || 0;
-          if (ridNum && ridNum <= lastMaxRound) continue;
-          
           const k = uniqId(r);
           if (!k) continue;
-          if (!state.seen.has(k)) {
-            state.seen.add(k);
+
+          const ridNum = Number(r.round_id || r.roundId || 0) || 0;
+          const table = tableOf(r) || 'unknown';
+          const lastRoundForTable = lastRoundIdByTable.get(table) || 0;
+
+          // 檢查記錄狀態 - 判斷是否為進行中狀態
+          const isInProgress = (() => {
+            const paymentStatus = r.game_payment_status;
+            const gameResult = r.gameResult || {};
+            const result = gameResult.result;
+
+            // payment_status=1 且沒有最終結果 = 進行中
+            // 注意：result=0 代表取消/無效，也是有效的最終結果
+            if (paymentStatus === 1 && ![0, 1, 2, 3].includes(result)) {
+              return true;
+            }
+
+            // 其他進行中的判斷條件
+            const status = r.status || r.game_status || '';
+            if (status && ['進行中', '開獎中', 'running', 'in_progress'].includes(status.toLowerCase())) {
+              return true;
+            }
+
+            return false;
+          })();
+
+          // 如果這個記錄之前見過
+          if (state.seen.has(k)) {
+            // 檢查是否從進行中變為已完成
+            if (state.pendingRounds.has(k)) {
+              const oldRecord = state.pendingRounds.get(k);
+
+              // 如果狀態從進行中變為已完成，加入更新列表
+              if (!isInProgress) {
+                console.debug('[BACKFILL] Status update detected:', k, 'completed');
+                updates.push(r);
+                state.pendingRounds.delete(k); // 移除已完成的記錄
+              } else {
+                // 仍在進行中，更新記錄和時間
+                state.pendingRounds.set(k, {record: r, lastSeen: Date.now()});
+              }
+            }
+            continue; // 已見過的記錄不加入fresh，但可能加入updates
+          }
+
+          // 新記錄處理
+          state.seen.add(k);
+
+          // 如果是新記錄且大於該桌最大round，才加入fresh
+          if (ridNum && ridNum > lastRoundForTable) {
+            fresh.push(r);
+          } else if (ridNum <= lastRoundForTable && ridNum > 0) {
+            // 舊的round但是新的記錄（可能是之前漏掉的），也加入fresh
+            console.debug('[BACKFILL] Found missed old record for table', table, ':', k);
+            fresh.push(r);
+          } else {
             fresh.push(r);
           }
-        }
-        
-        // 更新 lastMaxRound
-        if (fresh.length) {
-          const newRounds = fresh.map(x => Number(x.round_id||x.roundId||0)||0).filter(n => n > 0);
-          if (newRounds.length) {
-            lastMaxRound = Math.max(lastMaxRound, ...newRounds);
+
+          // 如果是進行中狀態，加入pending追蹤
+          if (isInProgress) {
+            state.pendingRounds.set(k, {record: r, lastSeen: Date.now()});
+            console.debug('[BACKFILL] Tracking in-progress record:', k);
           }
         }
 
-        if (typeof window.ingest_results === 'function' && fresh.length > 0) {
-          console.debug('[POLLER]', 'list=', list.length, 'fresh=', fresh.length);
-          await window.ingest_results(fresh);
+        // 清理超過5分鐘沒更新的pending記錄（避免記憶體洩漏）
+        const nowTime = Date.now();
+        const fiveMinutes = 5 * 60 * 1000;
+        for (const [key, {lastSeen}] of state.pendingRounds.entries()) {
+          if (nowTime - lastSeen > fiveMinutes) {
+            console.debug('[BACKFILL] Cleaning old pending record:', key);
+            state.pendingRounds.delete(key);
+          }
         }
+
+        // 檢查資料密度並動態調整回看時間
+        const densityThreshold = pageSize * 0.9; // 若達到頁面大小的90%就認為密度過高
+        const recordsByTable = new Map();
+        for (const r of list) {
+          const table = tableOf(r) || 'unknown';
+          recordsByTable.set(table, (recordsByTable.get(table) || 0) + 1);
+        }
+
+        // 調整每桌的動態回看時間
+        for (const [table, count] of recordsByTable.entries()) {
+          const currentLookback = lookbackMinutesByTable.get(table) || defaultLookbackMinutes;
+
+          if (count >= densityThreshold) {
+            // 資料密度過高，增加回看時間
+            const newLookback = Math.min(10, currentLookback + 2); // 最多10分鐘
+            lookbackMinutesByTable.set(table, newLookback);
+            console.debug('[DYNAMIC_LOOKBACK] Table', table, 'density high (' + count + '), increased lookback to', newLookback, 'min');
+          } else if (count < densityThreshold * 0.5 && currentLookback > defaultLookbackMinutes) {
+            // 資料密度較低且當前回看時間大於預設值，逐漸減少回看時間
+            const newLookback = Math.max(defaultLookbackMinutes, currentLookback - 0.5);
+            lookbackMinutesByTable.set(table, newLookback);
+            console.debug('[DYNAMIC_LOOKBACK] Table', table, 'density low (' + count + '), decreased lookback to', newLookback, 'min');
+          }
+        }
+
+        // 更新每桌的lastRoundId（只考慮fresh中的新記錄）
+        if (fresh.length) {
+          const roundsByTable = new Map();
+          for (const r of fresh) {
+            const ridNum = Number(r.round_id || r.roundId || 0) || 0;
+            const table = tableOf(r) || 'unknown';
+            if (ridNum > 0) {
+              const existing = roundsByTable.get(table) || 0;
+              if (ridNum > existing) roundsByTable.set(table, ridNum);
+            }
+          }
+          // 更新各桌台的最新round
+          for (const [table, maxRound] of roundsByTable.entries()) {
+            const currentMax = lastRoundIdByTable.get(table) || 0;
+            if (maxRound > currentMax) {
+              lastRoundIdByTable.set(table, maxRound);
+            }
+          }
+        }
+
+        // === 桌台分組 BACKFILL 掃描（在處理完主要資料後，發送到 ingest 前） ===
+        // 只要有 pendingRounds，就做「桌台分組 backfill 掃描」
+        if (state.pendingRounds && state.pendingRounds.size > 0 && window.__req_template__) {
+          // 1) 將 pending 依桌台分組，並抓每桌最早的 start_time
+          const groupByTable = new Map(); // table -> { earliestStart, keys:Set, rounds:Set }
+          for (const [k, info] of state.pendingRounds.entries()) {
+            const rec = info.record || {};
+            const table = tableOf(rec);
+            const start = startOf(rec);
+            if (!table || !start) continue;
+            const bucket = groupByTable.get(table) || { earliestStart: start, keys: new Set(), rounds: new Set() };
+            // 更新最早時間
+            if (new Date(start) < new Date(bucket.earliestStart)) bucket.earliestStart = start;
+            bucket.keys.add(k);
+            const rid = idOf(rec);
+            if (rid) bucket.rounds.add(String(rid));
+            groupByTable.set(table, bucket);
+          }
+
+          // 2) 控制每次最多掃 3 個桌台（輪轉）
+          const MAX_TABLE_SWEEPS = 3;
+          const tables = Array.from(groupByTable.keys()).slice(0, MAX_TABLE_SWEEPS);
+
+          for (const table of tables) {
+            const bucket = groupByTable.get(table);
+            // 使用該桌台的動態回看時間，至少5分鐘
+            const tableLookbackMinutes = Math.max(5, lookbackMinutesByTable.get(table) || defaultLookbackMinutes);
+            // 目標時間窗：該桌最早 pending 開局時間往前動態分鐘數到現在
+            const startBase = new Date(bucket.earliestStart || Date.now() - 10*60*1000);
+            const startTime = ts(new Date(startBase.getTime() - tableLookbackMinutes * 60 * 1000));
+            const endTime   = ts(new Date());
+
+            // 從模板複製請求（保證帶到正確 headers/其他必要欄位）
+            const t = window.__req_template__;
+            const h = new Headers(t.headers || {});
+            const token = (window._jwt_current || localStorage.getItem('access_token') || sessionStorage.getItem('access_token') || '').toString();
+            if (token) h.set('Authorization','Bearer '+token);
+            h.set('Accept','application/json, text/plain, */*');
+
+            // 把 URL 與 body 改成「單桌 + 時間窗」，並翻 1～3 頁
+            const MAX_PAGES = 3;
+            for (let pageIdx = 1; pageIdx <= MAX_PAGES; pageIdx++) {
+              const urlObj = new URL(t.url, location.origin);
+              const sp = urlObj.searchParams;
+              // 清掉時間/分頁參數
+              ['startTime','endTime','page','pageIndex','pageSize','limit','rowsCount'].forEach(k => sp.delete(k));
+              // 桌台參數鍵名（多猜幾個）
+              const tableKeys = ['table','table_id','tableId','table_code','tableCode','deskNo'];
+              for (const k of tableKeys) if (sp.has(k)) sp.set(k, table);
+
+              sp.set('startTime', startTime);
+              sp.set('endTime',   endTime);
+              sp.set('pageIndex', String(pageIdx));
+              sp.set('pageSize',  String(100)); // 環境上限
+
+              let body = t.body || '';
+              // 同步 body 參數（JSON or x-www-form-urlencoded）
+              try {
+                const obj = JSON.parse(body || '{}');
+                obj.startTime = startTime;
+                obj.endTime   = endTime;
+                obj.pageIndex = pageIdx;
+                obj.pageSize  = 100;
+                // 同樣猜測桌台欄位名
+                for (const k of tableKeys) if (k in obj) obj[k] = table;
+                body = JSON.stringify(obj);
+                if (!h.has('Content-Type')) h.set('Content-Type','application/json;charset=UTF-8');
+              } catch {
+                try {
+                  const p = new URLSearchParams(body);
+                  p.set('startTime', startTime);
+                  p.set('endTime',   endTime);
+                  p.set('pageIndex', String(pageIdx));
+                  p.set('pageSize',  String(100));
+                  for (const k of tableKeys) if (p.has(k)) p.set(k, table);
+                  body = p.toString();
+                  if (!h.has('Content-Type')) h.set('Content-Type','application/x-www-form-urlencoded; charset=UTF-8');
+                } catch {}
+              }
+
+              const resp = await fetch(urlObj.toString(), {
+                method: (t.method || 'POST').toUpperCase(),
+                headers: h, credentials:'include', cache:'no-store',
+                body: ((t.method || 'POST').toUpperCase() === 'GET') ? undefined : body
+              });
+
+              if (!resp.ok) continue;
+              const ct = resp.headers.get('content-type') || '';
+              if (!ct.includes('application/json')) continue;
+
+              const js = await resp.json();
+              const list2 = (js?.data?.list) || (js?.data?.rows) || (js?.data?.data) || js?.records || js?.list || [];
+              if (!Array.isArray(list2) || list2.length === 0) break;
+
+              // 專門檢查這個桌台的 pending 目標
+              const backfillUpdates = [];
+              for (const r of list2) {
+                const rid = String(idOf(r) || '');
+                const k = tableOf(r) + ':' + rid;
+                if (!bucket.keys.has(k)) continue; // 只關注這批 pending
+
+                // 判斷是否已完成
+                const paymentStatus = r.game_payment_status;
+                const result = (r.gameResult && r.gameResult.result);
+                const statusTxt = (r.status || r.game_status || '').toString().toLowerCase();
+                const done = (paymentStatus !== 1 && [1,2,3].includes(result)) || ['已派彩','closed','complete','completed','已結算','已派彩'].some(t => statusTxt.includes(t));
+
+                if (done) {
+                  backfillUpdates.push(r);
+                  state.pendingRounds.delete(k); // 解除追蹤
+                }
+              }
+
+              if (backfillUpdates.length && typeof window.ingest_results === 'function') {
+                console.debug('[BACKFILL] table', table, 'page', pageIdx, 'updates', backfillUpdates.length);
+                await window.ingest_results(backfillUpdates);
+              }
+
+              // 若這個桌台的目標都清掉了，就不用再翻下一頁
+              let anyLeft = false;
+              for (const key of bucket.keys) if (state.pendingRounds.has(key)) { anyLeft = true; break; }
+              if (!anyLeft) break;
+            }
+          }
+        }
+
+        // 合併新記錄和狀態更新記錄
+        const allRecords = [...fresh, ...updates];
+        const pendingTables = new Map();
+        for (const [k, info] of state.pendingRounds.entries()) {
+          const table = tableOf(info.record);
+          pendingTables.set(table, (pendingTables.get(table) || 0) + 1);
+        }
+        console.debug('[BACKFILL] Processing:', 'total=', list.length, 'fresh=', fresh.length, 'updates=', updates.length, 'pending=', state.pendingRounds.size, 'pending_by_table=', Object.fromEntries(pendingTables));
+
+        if (typeof window.ingest_results === 'function' && allRecords.length > 0) {
+          console.debug('[POLLER]', 'total_records=', allRecords.length, 'fresh=', fresh.length, 'status_updates=', updates.length);
+          await window.ingest_results(allRecords);
+        }
+
       } catch (e) {
         console.debug('[POLLER] Error:', e);
         state.consecutiveFails++;
       }
+
       await sleep(jitter(baseInterval));
     }
   };
 })();
 """)
 
-        # 等待輪詢器函數可用，然後啟動
-        await asyncio.sleep(1)  # 等待腳本載入
-        
-        # ✅ 新版（fire-and-forget，不阻塞）
-        await page.evaluate("""
-          (opts) => {
-            if (typeof window.__result_poller__ === 'function') {
-              setTimeout(() => { window.__result_poller__(opts); }, 0);
-              console.debug('[POLLER] fired');
-            } else {
-              console.error('Poller function not available');
-            }
-          }
-        """, { "url": "https://i.t9live3.vip/api/game/result/search", "interval_ms": int(interval_ms) })
-
+        # 等待輪詢器函數可用，然後啟動（fire-and-forget，不阻塞）
+        await asyncio.sleep(1)
+        await page.evaluate(
+            """(opts) => {
+  if (typeof window.__result_poller__ === 'function') {
+    setTimeout(() => { window.__result_poller__(opts); }, 0);
+    console.debug('[POLLER] fired');
+  } else {
+    console.error('Poller function not available');
+  }
+}""",
+            {
+                "url": "https://i.t9live3.vip/api/game/result/search",
+                "interval_ms": int(interval_ms),
+                "batch_size": int(BATCH_SIZE),
+            },
+        )
         logger.info(f"Started in-page poller with {interval_ms}ms interval")
 
-    async def precise_search_worker(self):
-        """精準搜尋工人：處理升級到精準搜尋的牌局"""
-        logger.info(f"Starting precise search worker (interval: {PRECISE_WORKER_INTERVAL}s)")
-
-        while self.is_running:
-            try:
-                await asyncio.sleep(PRECISE_WORKER_INTERVAL)
-
-                if not self.page or not self.precise_queue:
-                    continue
-
-                # 取出一個待處理項目
-                table, round_id = self.precise_queue.pop(0)
-                logger.info(f"[PRECISE] Processing {table}:{round_id}")
-
-                # 執行精準搜索
-                success = await self.lookup_round_in_page(round_id)
-
-                if success:
-                    # 成功找到並處理，從待回填中移除
-                    if round_id in self.pending[table]:
-                        del self.pending[table][round_id]
-                        logger.info(f"[PRECISE] Successfully found and removed {table}:{round_id}")
-                else:
-                    # 精準搜尋失敗，檢查是否需要重新排隊
-                    if round_id in self.pending[table]:
-                        meta = self.pending[table][round_id]
-                        age = time.time() - meta["first_seen_ts"]
-
-                        if age < ZOMBIE_TIME_SEC:
-                            # 重新排隊，但降低優先級
-                            if len(self.precise_queue) < 10:  # 避免隊列太長
-                                self.precise_queue.append((table, round_id))
-                                logger.debug(f"[PRECISE] Re-queued {table}:{round_id} for retry")
-                        else:
-                            # 超過僵屍線，放棄
-                            del self.pending[table][round_id]
-                            logger.info(f"[PRECISE] Dropping zombie round {table}:{round_id} (age: {age:.1f}s)")
-
-                # 節流控制
-                await asyncio.sleep(PRECISE_WORKER_INTERVAL)
-
-            except Exception as e:
-                logger.error(f"[PRECISE] Error in precise search worker: {e}")
-                await asyncio.sleep(5)
-
-    async def soft_refresh_every(self, base_seconds: int = 5):
-        """
-        智慧輕刷新：精準點擊上方工具列的「檢索」按鈕，避開左側選單
-        增加節流控制，避免頻繁點擊「檢索」按鈕
-        """
-        logger.info(f"Starting smart soft refresh every ~{base_seconds}s with throttling")
-        self._sr_fail = 0
-        self._last_search_click = 0  # 記錄上次點擊檢索的時間
-        self._min_search_interval = 8  # 最小檢索間隔（秒）
-        
-        while self.is_running:
-            try:
-                # 檢查頁籤可見性與防重入
-                busy = await self.page.evaluate("""
-(() => {
-  // 頁籤不可見 → 跳過
-  if (document.hidden) return 'HIDDEN';
-
-  // 還在處理上一次點擊 → 跳過
-  if (window.__softRefreshBusy__) return 'BUSY';
-
-  // 標記進行中，並設一個保險超時（避免永遠卡著）
-  window.__softRefreshBusy__ = true;
-  window.__softRefreshStartedAt__ = Date.now();
-  setTimeout(() => { window.__softRefreshBusy__ = false; }, 8000);
-  return 'OK';
-})()
-""")
-                if busy != "OK":
-                    # HIDDEN 或 BUSY 都先睡一小會再回來
-                    await asyncio.sleep(1.2)
-                    continue
-                
-                # 節流控制：檢查是否距離上次點擊檢索按鈕太近
-                current_time = time.time()
-                time_since_last_click = current_time - self._last_search_click
-
-                if time_since_last_click < self._min_search_interval:
-                    logger.debug(f"[THROTTLE] Skipping search click, too soon ({time_since_last_click:.1f}s < {self._min_search_interval}s)")
-                    # Wait for DOM to stabilize after refresh
-                    await asyncio.sleep(random.uniform(0.4, 0.8))
-                    continue
-
-                clicked = False
-                for frame in self.page.frames:
-                    if "i.t9live3.vip" not in frame.url:
-                        continue
-
-                    # --- A. 用 Locator 精準點「檢索」 ---
-                    try:
-                        # 1) 首選：role=button, name=檢索/查询/搜尋/搜索
-                        btn = frame.get_by_role(
-                            "button",
-                            name=re.compile(r"(檢索|检索|查询|查詢|搜尋|搜索|Search|Refresh)")
-                        ).first
-                        await btn.scroll_into_view_if_needed(timeout=1000)
-                        # 避開左側選單：只點畫面中間偏右的按鈕
-                        box = await btn.bounding_box()
-                        if box and box["x"] > 220:    # 左邊選單大多 < 200px
-                            await btn.click(timeout=1500)
-                            self._last_search_click = current_time  # 更新上次點擊時間
-                            logger.info(f"[SOFT_REFRESH] Locator clicked: 檢索 ({frame.url})")
-                            clicked = True
-                        else:
-                            raise Exception("button too left")
-                    except Exception:
-                        # 2) 備援：找包含「檢索」文本的可點元素，且限制在上方工具列區域
-                        try:
-                            await frame.evaluate("""
-                            (() => {
-                              const byText = el => (el.innerText||el.textContent||'').trim();
-                              const kw = /檢索|检索|查询|查詢|搜尋|搜索|Search|Refresh/;
-                              const regionTop = 80, regionBottom = 220, regionLeft = 220; // 上方工具列大致區域
-                              const cand = Array.from(document.querySelectorAll('button,[role="button"],.btn,.el-button,.ant-btn,a.button,a[role="button"]'))
-                                .filter(el => {
-                                  const r = el.getBoundingClientRect();
-                                  return kw.test(byText(el)) && r.top>=regionTop && r.bottom<=regionBottom && r.left>=regionLeft;
-                                });
-                              const target = cand[0];
-                              if (target){
-                                target.click?.();
-                                target.dispatchEvent?.(new MouseEvent('click',{bubbles:true,cancelable:true}));
-                                console.debug('[SOFT_REFRESH] Clicked: 檢索 (fallback)');
-                                return true;
-                              }
-                              return false;
-                            })()
-                            """)
-                            self._last_search_click = current_time  # 更新上次點擊時間
-                            clicked = True
-                        except Exception:
-                            pass
-
-                    if not clicked:
-                        continue
-
-                    # B) 等 2 秒看是否有頁面自己發出的 XHR；沒有就做一次 fallback
-                    xhr_observed = False
-                    try:
-                        await self.page.wait_for_response(
-                            lambda r: ("i.t9live3.vip/api/game/result/search" in r.url)
-                                      and (getattr(r.request, "resource_type", "") in ("xhr","fetch")),
-                            timeout=2000
-                        )
-                        logger.info("[SOFT_REFRESH] Observed page XHR")
-                        xhr_observed = True
-                        self._sr_fail = 0
-                    except Exception:
-                        logger.warning("[SOFT_REFRESH] No XHR observed — falling back to direct pull")
-                        
-                        # 直接拉取作為 fallback
-                        try:
-                            data = await self.make_api_request()
-                            if data and not data.get("_err"):
-                                records = self.extract_records(data)
-                                if records:
-                                    # 去重 + 只取前 BATCH_SIZE 筆
-                                    new_records = self._dedupe_new(records)[:BATCH_SIZE]
-                                    if new_records:
-                                        logger.info(f"[FALLBACK] pulled {len(new_records)} new records")
-                                        success = await self.send_to_ingest(new_records)
-                                        if success:
-                                            self.stats["records_processed"] += len(new_records)
-                                            self._sr_fail = 0
-                                        else:
-                                            self._sr_fail += 1
-                                    else:
-                                        logger.debug("[FALLBACK] no new records after dedup")
-                                        self._sr_fail = 0  # 雖然沒新資料，但請求本身成功
-                                else:
-                                    self._sr_fail += 1
-                            else:
-                                self._sr_fail += 1
-                        except Exception as fallback_error:
-                            logger.debug(f"[FALLBACK] error: {fallback_error}")
-                            self._sr_fail += 1
-                    
-                    # Wait for DOM to stabilize after refresh
-                    await asyncio.sleep(random.uniform(0.4, 0.8))
-
-                    break  # 這一輪已經成功處理；跳出 frame 迴圈
-
-            except Exception as e:
-                logger.debug(f"Smart refresh error: {e}")
-                self._sr_fail += 1
-            finally:
-                # 清除防重入旗標
-                try:
-                    await self.page.evaluate("window.__softRefreshBusy__ = false")
-                except:
-                    pass
-
-            # 帶一點抖動，避免節律痕跡，並加入退避邏輯
-            base = base_seconds + random.uniform(0.4, 1.0)
-            if self._sr_fail >= 3:
-                base += random.uniform(10, 20)  # 退避一會，給站方喘息
-            await asyncio.sleep(base)
-                
-    async def _handle_consecutive_failures(self):
-        """处理连续101错误的自我修复"""
-        self.consecutive_101_count += 1
-        
-        if self.consecutive_101_count == 1:
-            # 第1次101 → 輕度刷新
-            logger.warning(f"First 101 error, trying light refresh...")
-            try:
-                await self.page.reload(wait_until="domcontentloaded")
-                await asyncio.sleep(2)
-            except Exception as e:
-                logger.error(f"Light refresh failed: {e}")
-        elif self.consecutive_101_count == 2:
-            # 连2次101 → 刷新页面
-            logger.warning(f"Consecutive 101 errors: {self.consecutive_101_count}. Refreshing page...")
-            try:
-                await self.page.goto('https://i.t9live3.vip/', wait_until='domcontentloaded')
-                await asyncio.sleep(3)
-                await self.page.goto('https://i.t9live3.vip/#/gameResult', wait_until='networkidle')
-                await asyncio.sleep(2)
-            except Exception as e:
-                logger.error(f"Page refresh failed: {e}")
-        elif self.consecutive_101_count >= 3:
-            # 连3次 → 暂停30-60s
-            wait_time = 30 + random.uniform(0, 30)
-            logger.warning(f"Consecutive 101 errors: {self.consecutive_101_count}. Pausing for {wait_time:.1f}s...")
-            await asyncio.sleep(wait_time)
-    
     async def start(self):
         """启动监控器"""
         logger.info("Starting Existing Browser Monitor...")
@@ -1579,102 +1483,60 @@ class ExistingBrowserMonitor:
             raise RuntimeError("Failed to connect to existing browser")
 
         self.is_running = True
-        
-        if ACTIVE_PULL:
-            try:
-                ok = await self.discover_and_arm_template(timeout_ms=20000)
-                logger.info(f"Template armed: {ok}")
-            except Exception as e:
-                logger.warning(f"Template discovery skipped: {e}")
-            await self.start_poller(interval_ms=1000)
-        else:
-            logger.info("ACTIVE_PULL=False → 跳過模板偵測與 in-page poller（改走 soft-refresh-only）")
 
-        # === 啟動三任務：軟刷新 + 滑動帶檢測 + 精準搜尋工人 ===
-        soft_refresh_task = asyncio.create_task(self.soft_refresh_every(int(SOFT_REFRESH_SEC)))
-        precise_worker_task = asyncio.create_task(self.precise_search_worker())
+        # 嘗試發現並武裝模板（同時點「搜索/檢索」）
+        try:
+            ok = await self.discover_and_arm_template(timeout_ms=20000)
+            logger.info(f"Template armed: {ok}")
+        except Exception as e:
+            logger.warning(f"Template discovery skipped: {e}")
 
-        logger.info("Started sliding band backfill system with precise search worker")
+        # 啟動輪詢器（目前 poller 發出的請求會被路由擋掉，主要靠鏡射）
+        await self.start_poller(interval_ms=POLL_INTERVAL_MS)
+        logger.info("Monitor started successfully")
 
         try:
-            # 簡單保活即可（主要工作由滑動帶檢測在鏡射中完成）
+            # 簡單保活即可（主要工作由鏡射完成）
             while self.is_running:
                 await asyncio.sleep(60)
         finally:
-            soft_refresh_task.cancel()
-            precise_worker_task.cancel()
-            try:
-                await soft_refresh_task
-            except asyncio.CancelledError:
-                pass
-            try:
-                await precise_worker_task
-            except asyncio.CancelledError:
-                pass
             await self.cleanup()
-    
+
     async def stop(self):
         """停止监控器"""
         logger.info("Stopping monitor...")
         self.is_running = False
-    
+
     async def cleanup(self):
         """清理资源"""
         try:
-            # 不要关闭browser，因为那是用户的浏览器
+            # 不要关闭 browser，因为那是用户的浏览器
             if self.playwright:
                 await self.playwright.stop()
             logger.info("Cleanup completed")
         except Exception as e:
             logger.error(f"Cleanup error: {e}")
-    
+
     def get_stats(self) -> Dict[str, Any]:
         """获取统计信息"""
         uptime = time.time() - self.stats["start_time"]
-        success_rate = (
-            self.stats["successful_requests"] / max(1, self.stats["total_requests"]) * 100
-        )
-        
-        # 統計滑動帶回填狀態
-        total_pending = sum(len(rounds) for rounds in self.pending.values())
-        pending_by_table = {table: len(rounds) for table, rounds in self.pending.items() if rounds}
-        precise_queue_size = len(self.precise_queue)
+        success_rate = (self.stats["successful_requests"] / max(1, self.stats["total_requests"]) * 100)
 
-        # 統計各狀態的牌局數量
-        pending_stats = {"新發現": 0, "追蹤中": 0, "已升級": 0}
-        now = time.time()
-
-        for table, rounds in self.pending.items():
-            for round_id, meta in rounds.items():
-                age = now - meta["first_seen_ts"]
-                if meta["stale"]:
-                    pending_stats["已升級"] += 1
-                elif age > UPGRADE_TIME_SEC or meta["attempts"] >= UPGRADE_ATTEMPTS:
-                    pending_stats["追蹤中"] += 1
-                else:
-                    pending_stats["新發現"] += 1
+        # 回填機制統計
+        pending_count = len(getattr(self, '_pending_records', {}))
+        backfill_stats = {
+            "pending_in_progress_records": pending_count,
+            "total_seen_unique_keys": len(self._seen_set),
+        }
 
         return {
             **self.stats,
             "uptime_seconds": uptime,
             "success_rate_percent": round(success_rate, 2),
             "is_running": self.is_running,
-            "sliding_band_stats": {
-                "total_pending_rounds": total_pending,
-                "pending_by_table": pending_by_table,
-                "pending_by_status": pending_stats,
-                "precise_queue_size": precise_queue_size,
-                "scan_results_size": len(self.current_scan_results),
-                "config": {
-                    "scan_all_rows": SCAN_ALL_ROWS,
-                    "search_band": SEARCH_BAND,
-                    "upgrade_time_sec": UPGRADE_TIME_SEC,
-                    "upgrade_attempts": UPGRADE_ATTEMPTS,
-                    "soft_refresh_sec": SOFT_REFRESH_SEC,
-                    "precise_worker_interval": PRECISE_WORKER_INTERVAL
-                }
-            }
+            "backfill_stats": backfill_stats,
         }
+
 
 async def main():
     """主程式入口"""
@@ -1688,9 +1550,8 @@ async def main():
     print("2. Login to https://i.t9live3.vip in that Chrome window")
     print("3. Keep the browser window open")
     print("=" * 80)
-    
+
     monitor = ExistingBrowserMonitor()
-    
     try:
         await monitor.start()
     except KeyboardInterrupt:
@@ -1699,16 +1560,21 @@ async def main():
         logger.error(f"Monitor failed: {e}")
     finally:
         await monitor.stop()
-        
-        # 显示最终统计
-        stats = monitor.get_stats()
-        print("\n" + "=" * 60)
-        print("FINAL STATISTICS")
-        print("=" * 60)
-        print(f"Uptime: {stats['uptime_seconds']:.1f}s")
-        print(f"Total Requests: {stats['total_requests']}")
-        print(f"Success Rate: {stats['success_rate_percent']:.1f}%")
-        print(f"Records Processed: {stats['records_processed']}")
+
+    # 显示最终统计
+    stats = monitor.get_stats()
+    print("\n" + "=" * 60)
+    print("FINAL STATISTICS")
+    print("=" * 60)
+    print(f"Uptime: {stats['uptime_seconds']:.1f}s")
+    print(f"Total Requests: {stats['total_requests']}")
+    print(f"Success Rate: {stats['success_rate_percent']:.1f}%")
+    print(f"Records Processed: {stats['records_processed']}")
+    print("\nBACKFILL MECHANISM:")
+    backfill = stats.get('backfill_stats', {})
+    print(f"Pending In-Progress Records: {backfill.get('pending_in_progress_records', 0)}")
+    print(f"Total Unique Records Seen: {backfill.get('total_seen_unique_keys', 0)}")
+
 
 if __name__ == "__main__":
     asyncio.run(main())
