@@ -133,9 +133,36 @@ def extract_table_round_key(record: Dict[str, Any]) -> (Optional[str], Optional[
             round_id_int = int(round_id)
             return str(table_id), round_id_int
         except (ValueError, TypeError):
-            logger.debug(f"Invalid round_id format: {round_id}")
+            logger.warning(f"Invalid round_id format: {round_id} for table: {table_id}")
             return None, None
+
+    if not table_id:
+        logger.warning(f"Missing table_id in record: {record.keys()}")
+    if not round_id:
+        logger.warning(f"Missing round_id in record for table {table_id}")
+
     return None, None
+
+
+def check_data_integrity():
+    """檢查 results_by_table 的資料完整性"""
+    total_records = 0
+    for table_id, rounds in results_by_table.items():
+        if not isinstance(rounds, dict):
+            logger.error(f"[INTEGRITY] Table {table_id} has invalid rounds type: {type(rounds)}")
+            return False
+
+        table_count = len(rounds)
+        total_records += table_count
+
+        # 檢查 round_id 類型
+        for round_id in rounds.keys():
+            if not isinstance(round_id, int):
+                logger.error(f"[INTEGRITY] Table {table_id} has invalid round_id type: {round_id} ({type(round_id)})")
+                return False
+
+    logger.debug(f"[INTEGRITY] Data check passed: {len(results_by_table)} tables, {total_records} total records")
+    return True
 
 
 def upsert_record(record: Dict[str, Any]) -> bool:
@@ -144,11 +171,20 @@ def upsert_record(record: Dict[str, Any]) -> bool:
     if not table_id or round_id is None:
         return False
 
+    # 確保資料結構正確
     if table_id not in results_by_table:
+        results_by_table[table_id] = {}
+
+    # 額外檢查：確保 results_by_table[table_id] 是字典
+    if not isinstance(results_by_table[table_id], dict):
+        logger.error(f"[UPSERT] Table {table_id} rounds is not a dict: {type(results_by_table[table_id])}")
         results_by_table[table_id] = {}
 
     # 加上接收時間戳
     record["ingested_at"] = datetime.now().isoformat()
+
+    # 檢查是否為新記錄
+    is_new_record = round_id not in results_by_table[table_id]
 
     # Upsert
     results_by_table[table_id][round_id] = record
@@ -157,9 +193,11 @@ def upsert_record(record: Dict[str, Any]) -> bool:
     try:
         status_name = record.get("game_payment_status_name", "unknown")
         result_code = (record.get("gameResult") or {}).get("result", -1) if isinstance(record.get("gameResult"), dict) else -1
-        logger.debug(f"[UPSERT] {table_id}:{round_id} -> {status_name} (result: {result_code})")
-    except Exception:
-        pass
+        action = "NEW" if is_new_record else "UPDATE"
+        current_count = len(results_by_table[table_id])
+        logger.debug(f"[UPSERT] {action} {table_id}:{round_id} -> {status_name} (result: {result_code}) [Total: {current_count}]")
+    except Exception as e:
+        logger.error(f"[UPSERT] Debug output failed: {e}")
 
     return True
 
@@ -457,8 +495,102 @@ async def get_table_list():
 @app.get("/api/tables/summary")
 async def get_tables_summary():
     """取得所有桌號的摘要資訊"""
+    # 檢查資料完整性
+    if not check_data_integrity():
+        logger.error("[TABLE_SUMMARY] Data integrity check failed!")
+
     tables_data: Dict[str, Dict[str, Any]] = {}
 
+    # 從 results_by_table 計算真實的總局數和莊閒和統計
+    for table_id, rounds in results_by_table.items():
+        table_id = str(table_id)
+
+        # 雙重檢查：確保 rounds 是字典且不是 None
+        if not isinstance(rounds, dict):
+            logger.error(f"[TABLE_SUMMARY] Table {table_id} has invalid rounds: {type(rounds)}")
+            continue
+
+        game_count = len(rounds)
+
+        # 計算莊閒和統計
+        result_stats = {
+            "banker_wins": 0,
+            "player_wins": 0,
+            "ties": 0,
+            "other": 0
+        }
+
+        for round_id, record in rounds.items():
+            # 提取遊戲結果 - 檢查多種可能的格式
+            game_result = None
+
+            # 方法1: gameResult 是字典，包含 result 數字碼
+            if isinstance(record.get("gameResult"), dict):
+                result_code = record["gameResult"].get("result")
+                if result_code == 0:
+                    game_result = "莊勝"
+                elif result_code == 1:
+                    game_result = "閒勝"
+                elif result_code == 2:
+                    game_result = "和局"
+                elif result_code == 3:
+                    game_result = "取消/無效"
+                # 也檢查字典中的其他可能欄位
+                elif "win_lose_result" in record["gameResult"]:
+                    win_lose = record["gameResult"]["win_lose_result"]
+                    if win_lose == "莊勝":
+                        game_result = "莊勝"
+                    elif win_lose == "閒勝":
+                        game_result = "閒勝"
+                    elif win_lose == "和局":
+                        game_result = "和局"
+
+            # 方法2: gameResult 是字串
+            elif isinstance(record.get("gameResult"), str):
+                game_result_str = record["gameResult"]
+                if game_result_str in ["莊勝", "閒勝", "和局"]:
+                    game_result = game_result_str
+
+            # 方法3: 檢查其他可能的欄位名稱
+            if not game_result:
+                # 檢查是否有 win_lose_result 直接在 record 中
+                if "win_lose_result" in record:
+                    win_lose = record["win_lose_result"]
+                    if win_lose in ["莊勝", "閒勝", "和局"]:
+                        game_result = win_lose
+
+            # 統計結果
+            if game_result == "莊勝":
+                result_stats["banker_wins"] += 1
+            elif game_result == "閒勝":
+                result_stats["player_wins"] += 1
+            elif game_result == "和局":
+                result_stats["ties"] += 1
+            else:
+                result_stats["other"] += 1
+
+        # 驗算總局數
+        calculated_total = sum(result_stats.values())
+        if calculated_total != game_count:
+            logger.warning(f"[TABLE_SUMMARY] {table_id}: Round count mismatch! Storage: {game_count}, Calculated: {calculated_total}")
+
+        # 調試輸出
+        logger.debug(f"[TABLE_SUMMARY] {table_id}: {game_count} games, 莊:{result_stats['banker_wins']} 閒:{result_stats['player_wins']} 和:{result_stats['ties']} 其他:{result_stats['other']}")
+
+        if table_id not in tables_data:
+            tables_data[table_id] = {
+                "table_id": table_id,
+                "total_games": game_count,
+                "result_statistics": result_stats,
+                "latest_record": None,
+                "status_counts": {},
+                "last_update": None,
+            }
+        else:
+            tables_data[table_id]["total_games"] = game_count
+            tables_data[table_id]["result_statistics"] = result_stats
+
+    # 使用 latest_records 補充其他資訊（狀態、最新記錄等）
     for record in latest_records:
         table_id = record.get("table_id") or record.get("tableId") or record.get("table")
         if not table_id:
@@ -466,16 +598,77 @@ async def get_tables_summary():
         table_id = str(table_id)
 
         if table_id not in tables_data:
+            # 修正邏輯錯誤：正確計算該桌的總局數和莊閒和統計
+            rounds = results_by_table.get(table_id, {})
+            game_count = len(rounds)
+
+            # 計算莊閒和統計
+            result_stats = {
+                "banker_wins": 0,
+                "player_wins": 0,
+                "ties": 0,
+                "other": 0
+            }
+
+            for round_id, record in rounds.items():
+                # 提取遊戲結果 - 檢查多種可能的格式
+                game_result = None
+
+                # 方法1: gameResult 是字典，包含 result 數字碼
+                if isinstance(record.get("gameResult"), dict):
+                    result_code = record["gameResult"].get("result")
+                    if result_code == 0:
+                        game_result = "莊勝"
+                    elif result_code == 1:
+                        game_result = "閒勝"
+                    elif result_code == 2:
+                        game_result = "和局"
+                    elif result_code == 3:
+                        game_result = "取消/無效"
+                    # 也檢查字典中的其他可能欄位
+                    elif "win_lose_result" in record["gameResult"]:
+                        win_lose = record["gameResult"]["win_lose_result"]
+                        if win_lose == "莊勝":
+                            game_result = "莊勝"
+                        elif win_lose == "閒勝":
+                            game_result = "閒勝"
+                        elif win_lose == "和局":
+                            game_result = "和局"
+
+                # 方法2: gameResult 是字串
+                elif isinstance(record.get("gameResult"), str):
+                    game_result_str = record["gameResult"]
+                    if game_result_str in ["莊勝", "閒勝", "和局"]:
+                        game_result = game_result_str
+
+                # 方法3: 檢查其他可能的欄位名稱
+                if not game_result:
+                    # 檢查是否有 win_lose_result 直接在 record 中
+                    if "win_lose_result" in record:
+                        win_lose = record["win_lose_result"]
+                        if win_lose in ["莊勝", "閒勝", "和局"]:
+                            game_result = win_lose
+
+                # 統計結果
+                if game_result == "莊勝":
+                    result_stats["banker_wins"] += 1
+                elif game_result == "閒勝":
+                    result_stats["player_wins"] += 1
+                elif game_result == "和局":
+                    result_stats["ties"] += 1
+                else:
+                    result_stats["other"] += 1
+
             tables_data[table_id] = {
                 "table_id": table_id,
-                "total_games": 0,
+                "total_games": game_count,
+                "result_statistics": result_stats,
                 "latest_record": None,
                 "status_counts": {},
                 "last_update": None,
             }
 
-        # 更新計數
-        tables_data[table_id]["total_games"] += 1
+        # 不再從 latest_records 計算總局數，只處理狀態統計
 
         # 狀態統計
         status = record.get("game_payment_status_name", "未知")
@@ -596,6 +789,91 @@ async def get_metrics():
         "state_index_size": len(state_index),
         "timestamp": datetime.now().isoformat(),
     }
+
+
+# 調試端點 - 檢查 results_by_table 狀態
+@app.get("/api/debug/tables")
+async def debug_tables():
+    """調試端點：檢查 results_by_table 的詳細狀態"""
+    # 執行完整性檢查
+    integrity_status = check_data_integrity()
+
+    debug_info = {
+        "integrity_check": integrity_status,
+        "results_by_table_summary": {},
+        "latest_records_count": len(latest_records),
+        "state_index_count": len(state_index),
+        "total_games_across_all_tables": sum(len(rounds) for rounds in results_by_table.values()),
+        "timestamp": datetime.now().isoformat(),
+    }
+
+    for table_id, rounds in results_by_table.items():
+        if not isinstance(rounds, dict):
+            debug_info["results_by_table_summary"][str(table_id)] = {
+                "error": f"Invalid rounds type: {type(rounds)}"
+            }
+            continue
+
+        round_ids = sorted(rounds.keys())
+        debug_info["results_by_table_summary"][str(table_id)] = {
+            "total_rounds": len(rounds),
+            "min_round_id": min(round_ids) if round_ids else None,
+            "max_round_id": max(round_ids) if round_ids else None,
+            "latest_5_rounds": round_ids[-5:] if len(round_ids) >= 5 else round_ids,
+            "earliest_5_rounds": round_ids[:5] if len(round_ids) >= 5 else round_ids,
+            "rounds_type_check": all(isinstance(rid, int) for rid in round_ids),
+        }
+
+        # 特別檢查是否有重複的 round_id
+        if len(round_ids) != len(set(round_ids)):
+            debug_info["results_by_table_summary"][str(table_id)]["duplicate_round_ids"] = True
+
+    return debug_info
+
+
+# 調試端點 - 檢查特定桌號的詳細資料
+@app.get("/api/debug/tables/{table_id}")
+async def debug_specific_table(table_id: str):
+    """調試端點：檢查特定桌號的詳細狀態"""
+    if table_id not in results_by_table:
+        return {"error": f"Table {table_id} not found in results_by_table"}
+
+    rounds = results_by_table[table_id]
+    round_ids = sorted(rounds.keys())
+
+    debug_info = {
+        "table_id": table_id,
+        "total_rounds": len(rounds),
+        "rounds_data_type": type(rounds).__name__,
+        "all_round_ids": round_ids,
+        "round_id_gaps": [],
+        "sample_records": {},
+        "timestamp": datetime.now().isoformat(),
+    }
+
+    # 檢查 round_id 間隙
+    for i in range(1, len(round_ids)):
+        gap = round_ids[i] - round_ids[i-1]
+        if gap > 1:
+            debug_info["round_id_gaps"].append({
+                "from": round_ids[i-1],
+                "to": round_ids[i],
+                "gap_size": gap - 1
+            })
+
+    # 取樣幾個記錄
+    sample_indices = [0, len(round_ids)//2, -1] if len(round_ids) > 2 else list(range(len(round_ids)))
+    for idx in sample_indices:
+        if 0 <= idx < len(round_ids):
+            round_id = round_ids[idx]
+            record = rounds[round_id]
+            debug_info["sample_records"][f"round_{round_id}"] = {
+                "game_payment_status_name": record.get("game_payment_status_name"),
+                "ingested_at": record.get("ingested_at"),
+                "keys": list(record.keys())
+            }
+
+    return debug_info
 
 
 # 事件統計

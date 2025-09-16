@@ -1194,7 +1194,7 @@ class ExistingBrowserMonitor:
           const isInProgress = (() => {
             const paymentStatus = r.game_payment_status;
             const gameResult = r.gameResult || {};
-            const result = gameResult.result;
+            const result = Number(gameResult.result);
 
             // payment_status=1 且沒有最終結果 = 進行中
             // 注意：result=0 代表取消/無效，也是有效的最終結果
@@ -1411,7 +1411,7 @@ class ExistingBrowserMonitor:
                 const paymentStatus = r.game_payment_status;
                 const result = (r.gameResult && r.gameResult.result);
                 const statusTxt = (r.status || r.game_status || '').toString().toLowerCase();
-                const done = (paymentStatus !== 1 && [1,2,3].includes(result)) || ['已派彩','closed','complete','completed','已結算','已派彩'].some(t => statusTxt.includes(t));
+                const done = (paymentStatus !== 1 && [0,1,2,3].includes(result)) || ['已派彩','closed','complete','completed','已結算','已派彩'].some(t => statusTxt.includes(t));
 
                 if (done) {
                   backfillUpdates.push(r);

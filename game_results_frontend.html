@@ -59,6 +59,14 @@
         .stat-value.warning { color: #fbbf24; }
         .stat-value.error { color: #ef4444; }
         .stat-value.info { color: #60a5fa; }
+        .stat-value.banker { color: #ef4444; }
+        .stat-value.player { color: #3b82f6; }
+        .stat-value.tie { color: #22c55e; }
+
+        .result-statistics { margin-top: 20px; border-top: 1px solid #333; padding-top: 20px; }
+        .result-stats { font-size: 0.9rem; color: #bbb; }
+        .verify-ok { color: #4ade80; }
+        .verify-error { color: #f87171; font-weight: bold; }
         
         .main-content { display: grid; grid-template-columns: 1fr 400px; gap: 20px; height: 70vh; }
         .panel { background: #2a2a2a; border: 1px solid #333; border-radius: 8px; overflow: hidden; }
@@ -85,6 +93,22 @@
         .event-time { font-size: 0.8rem; color: #888; }
         .event-content { font-size: 0.9rem; }
         .event-content pre { background: #111; padding: 8px; border-radius: 4px; overflow-x: auto; font-size: 0.8rem; }
+
+        .event-details { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 8px; }
+        .detail-item {
+            display: inline-block;
+            background: rgba(102, 126, 234, 0.1);
+            color: #a3a3f5;
+            padding: 3px 8px;
+            border-radius: 12px;
+            font-size: 0.8rem;
+            border: 1px solid rgba(102, 126, 234, 0.2);
+        }
+        .error-details .detail-item {
+            background: rgba(239, 68, 68, 0.1);
+            color: #fca5a5;
+            border-color: rgba(239, 68, 68, 0.2);
+        }
         
         .badge { padding: 2px 6px; border-radius: 3px; font-size: 0.8rem; }
         .badge-success { background: #166534; color: #86efac; }
@@ -172,6 +196,10 @@
                 <div class="stat-value" id="connectionTime">--</div>
             </div>
             <div class="stat-card">
+                <div class="stat-title">監控時長</div>
+                <div class="stat-value info" id="monitoringDuration">--</div>
+            </div>
+            <div class="stat-card">
                 <div class="stat-title">當前桌號</div>
                 <div class="stat-value info" id="currentTable">全部</div>
             </div>
@@ -190,6 +218,22 @@
             <div class="stat-card">
                 <div class="stat-title">錯誤數</div>
                 <div class="stat-value error" id="errorCount">0</div>
+            </div>
+        </div>
+
+        <!-- 莊閒和統計區域 -->
+        <div class="stats result-statistics" id="resultStatistics">
+            <div class="stat-card">
+                <div class="stat-title">莊勝</div>
+                <div class="stat-value banker" id="bankerWins">0</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-title">閒勝</div>
+                <div class="stat-value player" id="playerWins">0</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-title">和局</div>
+                <div class="stat-value tie" id="tieResults">0</div>
             </div>
         </div>
 
@@ -229,6 +273,33 @@
     </div>
 
     <script>
+        // 桌號映射表 - 可輕鬆擴展
+        const TABLE_MAPPING = {
+            'WG7': 'BG_131',
+            'WG8': 'BG_132',
+            'WG9': 'BG_133',
+            'WG10': 'BG_135',
+            'WG11': 'BG_136',
+            'WG12': 'BG_137',
+            'WG13': 'BG_138'
+            // 未來可以在此添加更多映射
+        };
+
+        // 桌號映射函數
+        function mapTableId(originalTableId) {
+            if (!originalTableId) return originalTableId;
+            return TABLE_MAPPING[originalTableId] || originalTableId;
+        }
+
+        // 反向映射函數（用於API調用時需要原始桌號）
+        function unmapTableId(displayTableId) {
+            if (!displayTableId) return displayTableId;
+            for (const [original, display] of Object.entries(TABLE_MAPPING)) {
+                if (display === displayTableId) return original;
+            }
+            return displayTableId;
+        }
+
         let eventSource = null;
         let isConnected = false;
         let connectionStartTime = null;
@@ -244,6 +315,10 @@
         let consecutiveErrors = 0;
         let isPageStuck = false;
         let lastActivityTime = Date.now();
+
+        // 監控開始時間（頁面載入時間）
+        let monitoringStartTime = Date.now();
+        let monitoringDurationInterval = null;
 
         // Frontend store and deduplication
         const recordStore = new Map(); // key: tableId:roundId, value: { phase, hash, record }
@@ -268,6 +343,61 @@
             elements.totalResults.textContent = totalGames;
         }
 
+        function updateResultStatistics() {
+            let totalStats = {
+                banker_wins: 0,
+                player_wins: 0,
+                ties: 0,
+                other: 0
+            };
+
+            if (currentTableId) {
+                // 特定桌號：使用前端 gameResults 的完整資料（因為已經過濾且獲取了該桌所有歷史）
+                const resultsToAnalyze = gameResults.filter(r => String(r.tableId) === String(currentTableId));
+
+                resultsToAnalyze.forEach(result => {
+                    const gameResult = result.gameResult;
+                    if (gameResult === '莊勝') {
+                        totalStats.banker_wins++;
+                    } else if (gameResult === '閒勝') {
+                        totalStats.player_wins++;
+                    } else if (gameResult === '和局') {
+                        totalStats.ties++;
+                    } else if (gameResult && gameResult !== '進行中' && gameResult !== '投注中' && gameResult !== '開獎中') {
+                        totalStats.other++;
+                    }
+                });
+
+                console.log('[STATS] 特定桌號', currentTableId, '前端資料統計:', totalStats, '總筆數:', resultsToAnalyze.length);
+            } else {
+                // 全部桌號：使用後端的完整統計數據
+                console.log('[STATS DEBUG] availableTables:', availableTables);
+                console.log('[STATS DEBUG] availableTables.length:', availableTables.length);
+
+                availableTables.forEach((table, index) => {
+                    console.log(`[STATS DEBUG ${index}] Table:`, table.table_id, 'has result_statistics:', !!table.result_statistics);
+
+                    if (table.result_statistics) {
+                        console.log(`[STATS DEBUG ${index}] Stats:`, table.result_statistics);
+                        totalStats.banker_wins += table.result_statistics.banker_wins || 0;
+                        totalStats.player_wins += table.result_statistics.player_wins || 0;
+                        totalStats.ties += table.result_statistics.ties || 0;
+                        totalStats.other += table.result_statistics.other || 0;
+                    } else {
+                        console.log(`[STATS DEBUG ${index}] No result_statistics for table:`, table.table_id);
+                    }
+                });
+
+                console.log('[STATS] 全部桌號後端統計:', totalStats);
+                console.log('[STATS] 期望的總和應該接近總局數:', elements.totalResults.textContent);
+            }
+
+            // 更新顯示
+            elements.bankerWins.textContent = totalStats.banker_wins;
+            elements.playerWins.textContent = totalStats.player_wins;
+            elements.tieResults.textContent = totalStats.ties;
+        }
+
         const elements = {
             status: document.getElementById('connectionStatus'),
             text: document.getElementById('connectionText'),
@@ -278,8 +408,12 @@
             lastUpdate: document.getElementById('lastUpdate'),
             errorCount: document.getElementById('errorCount'),
             connectionTime: document.getElementById('connectionTime'),
+            monitoringDuration: document.getElementById('monitoringDuration'),
             currentTable: document.getElementById('currentTable'),
             activeTables: document.getElementById('activeTables'),
+            bankerWins: document.getElementById('bankerWins'),
+            playerWins: document.getElementById('playerWins'),
+            tieResults: document.getElementById('tieResults'),
             tableSelect: document.getElementById('tableSelect'),
             tableTabs: document.getElementById('tableTabs'),
             tableOverview: document.getElementById('tableOverview'),
@@ -405,6 +539,7 @@
 
             if (newCount > 0) {
                 updateTotalGamesCount();
+                updateResultStatistics();
                 lastActivityTime = Date.now();
                 elements.lastUpdate.textContent = new Date().toLocaleTimeString();
                 updateGameTable();
@@ -422,6 +557,7 @@
                 updateTableTabs();
                 updateOverview();
                 updateTotalGamesCount();
+                updateResultStatistics();
                 elements.activeTables.textContent = data.total_tables || 0;
             } catch (error) {
                 console.error('獲取桌號失敗:', error);
@@ -432,14 +568,22 @@
         function updateTableSelector() {
             const select = elements.tableSelect;
             select.innerHTML = '<option value="">全部桌號</option>';
-            
-            availableTables.forEach(table => {
+
+            // 根據映射後的桌號進行排序
+            const sortedTables = [...availableTables].sort((a, b) => {
+                const displayA = mapTableId(a.table_id);
+                const displayB = mapTableId(b.table_id);
+                return displayA.localeCompare(displayB, undefined, { numeric: true });
+            });
+
+            sortedTables.forEach(table => {
                 const option = document.createElement('option');
-                option.value = table.table_id;
-                option.textContent = `${table.table_id} (${table.current_status})`;
+                option.value = table.table_id; // 保持原始桌號作為 value (用於API調用)
+                const displayTableId = mapTableId(table.table_id); // 顯示映射後的桌號
+                option.textContent = `${displayTableId} (${table.current_status})`;
                 select.appendChild(option);
             });
-            
+
             if (currentTableId) {
                 select.value = currentTableId;
             }
@@ -456,15 +600,22 @@
             allTab.onclick = () => switchToTable('');
             tabsContainer.appendChild(allTab);
             
-            // 各桌標籤
-            availableTables.forEach(table => {
+            // 各桌標籤 - 根據映射後的桌號排序
+            const sortedTables = [...availableTables].sort((a, b) => {
+                const displayA = mapTableId(a.table_id);
+                const displayB = mapTableId(b.table_id);
+                return displayA.localeCompare(displayB, undefined, { numeric: true });
+            });
+
+            sortedTables.forEach(table => {
                 const tab = document.createElement('div');
                 tab.className = `table-tab ${currentTableId === table.table_id ? 'active' : ''}`;
                 if (table.current_status === '投注中' || table.current_status === '開獎中') {
                     tab.classList.add('has-activity');
                 }
+                const displayTableId = mapTableId(table.table_id); // 顯示映射後的桌號
                 tab.innerHTML = `
-                    <div>${table.table_id}</div>
+                    <div>${displayTableId}</div>
                     <div style="font-size: 0.7rem; color: #888;">${table.current_status}</div>
                 `;
                 tab.onclick = () => switchToTable(table.table_id);
@@ -475,30 +626,49 @@
         function updateOverview() {
             const container = elements.tableOverview;
             container.innerHTML = '';
-            
-            availableTables.forEach(table => {
+
+            // 根據映射後的桌號排序
+            const sortedTables = [...availableTables].sort((a, b) => {
+                const displayA = mapTableId(a.table_id);
+                const displayB = mapTableId(b.table_id);
+                return displayA.localeCompare(displayB, undefined, { numeric: true });
+            });
+
+            sortedTables.forEach(table => {
                 const card = document.createElement('div');
                 card.className = 'table-card';
                 card.onclick = () => {
                     toggleOverview();
                     switchToTable(table.table_id);
                 };
-                
+
                 const statusClass = getStatusBadgeClass(table.current_status);
-                
+                const displayTableId = mapTableId(table.table_id); // 顯示映射後的桌號
+
                 card.innerHTML = `
                     <div class="table-card-header">
-                        <div class="table-card-title">${table.table_id}</div>
+                        <div class="table-card-title">${displayTableId}</div>
                         <span class="badge ${statusClass}">${table.current_status}</span>
                     </div>
                     <div class="table-card-content">
                         <div class="table-card-item"><strong>最新結果:</strong> ${table.latest_result}</div>
                         <div class="table-card-item"><strong>最新局號:</strong> ${table.latest_round_id}</div>
                         <div class="table-card-item"><strong>總局數:</strong> ${table.total_games}</div>
+                        ${table.result_statistics ? `
+                            <div class="table-card-item">
+                                <strong>勝負統計:</strong>
+                                <span class="result-stats">
+                                    莊 ${table.result_statistics.banker_wins} |
+                                    閒 ${table.result_statistics.player_wins} |
+                                    和 ${table.result_statistics.ties}
+                                    ${table.result_statistics.other > 0 ? ` | 其他 ${table.result_statistics.other}` : ''}
+                                </span>
+                            </div>
+                        ` : ''}
                         <div class="table-card-item"><strong>開局時間:</strong> ${formatTime(table.game_start_time)}</div>
                     </div>
                 `;
-                
+
                 container.appendChild(card);
             });
         }
@@ -510,27 +680,31 @@
 
         function switchToTable(tableId) {
             currentTableId = tableId;
-            elements.currentTable.textContent = tableId || '全部';
+            const displayTableId = tableId ? mapTableId(tableId) : '全部';
+            elements.currentTable.textContent = displayTableId;
             elements.tableSelect.value = tableId;
-            
+
             // 更新標籤狀態
             document.querySelectorAll('.table-tab').forEach(tab => {
                 tab.classList.remove('active');
             });
-            
+
             if (tableId === '') {
                 document.querySelector('.table-tab:first-child').classList.add('active');
                 elements.panelTitle.textContent = '遊戲結果 - 全部桌號 (最新 30 筆)';
             } else {
+                // 使用映射後的桌號來查找標籤
+                const mappedTableId = mapTableId(tableId);
                 const activeTab = Array.from(document.querySelectorAll('.table-tab')).find(tab =>
-                    tab.textContent.includes(tableId)
+                    tab.textContent.includes(mappedTableId)
                 );
                 if (activeTab) activeTab.classList.add('active');
-                elements.panelTitle.textContent = `遊戲結果 - ${tableId} (最新 30 筆)`;
+                elements.panelTitle.textContent = `遊戲結果 - ${mappedTableId} (全部資料)`;
             }
 
             // 更新總局數顯示
             updateTotalGamesCount();
+            updateResultStatistics();
 
             refreshCurrentTable();
         }
@@ -539,8 +713,10 @@
             try {
                 let url;
                 if (currentTableId) {
-                    url = `http://127.0.0.1:8000/api/tables/${currentTableId}?limit=30`;
+                    // 特定桌號顯示所有資料
+                    url = `http://127.0.0.1:8000/api/tables/${currentTableId}?limit=1000`;
                 } else {
+                    // 全部桌號仍保持30筆限制
                     url = 'http://127.0.0.1:8000/api/latest?limit=30';
                 }
 
@@ -556,6 +732,7 @@
 
                 updateGameTable();
                 updateTotalGamesCount();
+                updateResultStatistics();
                 addEvent('system', `刷新${currentTableId || '全部'}桌號數據`, {
                     table: currentTableId || '全部',
                     count: records.length
@@ -708,10 +885,16 @@
 
         function handleGameResult(data) {
             let accepted = 0;
+            let tables = new Set();
 
             const take = (r) => {
                 try {
-                    if (applyRecord(r)) accepted++;
+                    if (applyRecord(r)) {
+                        accepted++;
+                        // 提取桌號資訊
+                        const tableId = r.table_id || r.tableId || r.table;
+                        if (tableId) tables.add(tableId);
+                    }
                 } catch (e) {
                     console.error('applyRecord failed:', e);
                 }
@@ -732,15 +915,24 @@
             // 只有真的有變更，才更新統計與畫面
             if (accepted > 0) {
                 updateTotalGamesCount();
+                updateResultStatistics();
                 lastActivityTime = Date.now();
                 elements.lastUpdate.textContent = new Date().toLocaleTimeString();
                 updateGameTable();
             }
 
-            addEvent('result', '收到遊戲結果', {
+            // 建立事件資訊
+            const eventPayload = {
                 latency: data.latency_ms || 'N/A',
-                accepted
-            });
+                accepted: accepted
+            };
+
+            // 如果有桌號資訊，加入到 payload
+            if (tables.size > 0) {
+                eventPayload.tables = Array.from(tables).join(', ');
+            }
+
+            addEvent('result', '收到遊戲結果', eventPayload);
 
             // 刷新桌號列表（如果有新桌號）
             setTimeout(fetchTables, 1000);
@@ -837,7 +1029,8 @@
                 cell.colSpan = 6;
                 cell.style.textAlign = 'center';
                 cell.style.color = '#888';
-                cell.textContent = currentTableId ? `${currentTableId} 桌暫無遊戲結果` : '暫無遊戲結果';
+                const displayCurrentTableId = currentTableId ? mapTableId(currentTableId) : null;
+                cell.textContent = displayCurrentTableId ? `${displayCurrentTableId} 桌暫無遊戲結果` : '暫無遊戲結果';
                 return;
             }
 
@@ -846,7 +1039,8 @@
             // 依「局號」由大到小（最新在前），保證同桌內排序正確
             filtered.sort((a, b) => (Number(b.roundId) || 0) - (Number(a.roundId) || 0));
 
-            const limited = filtered.slice(0, 30);
+            // 根據選擇的桌號決定顯示筆數
+            const limited = currentTableId ? filtered : filtered.slice(0, 30);
             const sortedResults = limited;
 
             sortedResults.forEach((result, index) => {
@@ -857,12 +1051,12 @@
                     row.className = 'betting';
                 } else if (result.status === '開獎中' || result.gameResult === '進行中') {
                     row.className = 'in-progress';
-                } else if (index < 5) {
-                    row.className = 'fresh'; // 最新 5 筆標記為新增
+                } else if (index === 0 && (result.gameResult === '莊勝' || result.gameResult === '閒勝' || result.gameResult === '和局')) {
+                    row.className = 'fresh'; // 只有最新一筆派彩結果才顯示綠色效果
                 }
 
                 row.insertCell(0).textContent = result.roundId;
-                row.insertCell(1).textContent = result.tableId;
+                row.insertCell(1).textContent = mapTableId(result.tableId); // 顯示映射後的桌號
                 row.insertCell(2).textContent = formatTime(result.startTime);
                 row.insertCell(3).textContent = result.gameResult;
 
@@ -949,13 +1143,72 @@
             return 'badge-warning';
         }
 
+        function formatEventPayload(type, payload) {
+            if (!payload || Object.keys(payload).length === 0) return '';
+
+            switch (type) {
+                case 'result':
+                    return `
+                        <div class="event-details">
+                            ${payload.latency !== 'N/A' ? `<span class="detail-item">延遲: ${payload.latency}ms</span>` : ''}
+                            ${payload.accepted ? `<span class="detail-item">接受: ${payload.accepted} 筆</span>` : ''}
+                            ${payload.tables ? `<span class="detail-item">桌號: ${payload.tables.split(', ').map(t => mapTableId(t)).join(', ')}</span>` : ''}
+                        </div>
+                    `;
+
+                case 'system':
+                    let systemDetails = '';
+                    if (payload.table) {
+                        const displayTable = payload.table === '全部' ? '全部' : mapTableId(payload.table);
+                        systemDetails += `<span class="detail-item">桌號: ${displayTable}</span>`;
+                    }
+                    if (payload.count) systemDetails += `<span class="detail-item">數量: ${payload.count}</span>`;
+                    if (payload.url) systemDetails += `<span class="detail-item">連接: ${payload.url}</span>`;
+                    if (payload.connectTime) systemDetails += `<span class="detail-item">耗時: ${payload.connectTime}ms</span>`;
+                    return systemDetails ? `<div class="event-details">${systemDetails}</div>` : '';
+
+                case 'heartbeat':
+                    let heartbeatDetails = '';
+                    if (payload.timestamp) {
+                        try {
+                            const time = new Date(payload.timestamp * 1000).toLocaleTimeString();
+                            heartbeatDetails += `<span class="detail-item">時間: ${time}</span>`;
+                        } catch (e) {
+                            heartbeatDetails += `<span class="detail-item">時間: ${payload.timestamp}</span>`;
+                        }
+                    }
+                    if (payload.latency && payload.latency !== 'N/A') {
+                        heartbeatDetails += `<span class="detail-item">延遲: ${payload.latency}ms</span>`;
+                    }
+                    return heartbeatDetails ? `<div class="event-details">${heartbeatDetails}</div>` : '';
+
+                case 'error':
+                    return `
+                        <div class="event-details error-details">
+                            ${payload.error ? `<span class="detail-item">錯誤: ${payload.error}</span>` : ''}
+                        </div>
+                    `;
+
+                default:
+                    // 對於其他類型，簡化顯示重要字段
+                    const importantFields = ['status', 'count', 'message', 'success'];
+                    let defaultDetails = '';
+                    for (const field of importantFields) {
+                        if (payload[field] !== undefined) {
+                            defaultDetails += `<span class="detail-item">${field}: ${payload[field]}</span>`;
+                        }
+                    }
+                    return defaultDetails ? `<div class="event-details">${defaultDetails}</div>` : '';
+            }
+        }
+
         function addEvent(type, title, payload) {
             const eventItem = document.createElement('div');
             eventItem.className = 'event-item ' + type;
-            
+
             const now = new Date();
             const timeStr = now.toLocaleTimeString();
-            
+
             eventItem.innerHTML = `
                 <div class="event-header">
                     <span class="event-type">${type}</span>
@@ -963,12 +1216,12 @@
                 </div>
                 <div class="event-content">
                     <strong>${title}</strong>
-                    ${payload && Object.keys(payload).length > 0 ? `<pre>${JSON.stringify(payload, null, 2)}</pre>` : ''}
+                    ${formatEventPayload(type, payload)}
                 </div>
             `;
 
             elements.eventsList.insertBefore(eventItem, elements.eventsList.firstChild);
-            
+
             // 只保留最新 20 個事件
             while (elements.eventsList.children.length > 20) {
                 elements.eventsList.removeChild(elements.eventsList.lastChild);
@@ -989,12 +1242,58 @@
             recordStore.clear();
 
             updateTotalGamesCount();
+            updateResultStatistics();
             elements.errorCount.textContent = '0';
             elements.lastUpdate.textContent = '--';
+
+            // 重置監控時間
+            resetMonitoringTimer();
 
             updateGameTable();
             clearResults();
         }
+
+        // 格式化時間長度
+        function formatDuration(milliseconds) {
+            const seconds = Math.floor(milliseconds / 1000);
+            const minutes = Math.floor(seconds / 60);
+            const hours = Math.floor(minutes / 60);
+            const days = Math.floor(hours / 24);
+
+            if (days > 0) {
+                return `${days}天 ${hours % 24}時 ${minutes % 60}分`;
+            } else if (hours > 0) {
+                return `${hours}時 ${minutes % 60}分 ${seconds % 60}秒`;
+            } else if (minutes > 0) {
+                return `${minutes}分 ${seconds % 60}秒`;
+            } else {
+                return `${seconds}秒`;
+            }
+        }
+
+        // 更新監控時長
+        function updateMonitoringDuration() {
+            const duration = Date.now() - monitoringStartTime;
+            elements.monitoringDuration.textContent = formatDuration(duration);
+        }
+
+        // 啟動監控時長定時器
+        function startMonitoringTimer() {
+            if (monitoringDurationInterval) {
+                clearInterval(monitoringDurationInterval);
+            }
+            monitoringDurationInterval = setInterval(updateMonitoringDuration, 1000);
+            updateMonitoringDuration(); // 立即更新一次
+        }
+
+        // 重置監控時間（可選功能）
+        function resetMonitoringTimer() {
+            monitoringStartTime = Date.now();
+            updateMonitoringDuration();
+        }
+
+        // 頁面載入時啟動監控定時器
+        startMonitoringTimer();
 
         // 自動連接
         setTimeout(() => {
