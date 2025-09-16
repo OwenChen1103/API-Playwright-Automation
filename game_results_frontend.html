@@ -137,7 +137,6 @@
     <div class="container">
         <header class="header">
             <h1 class="title">T9 遊戲結果即時監控</h1>
-            <p class="subtitle">基於 SSE 的零延遲遊戲結果監控系統 - 分桌顯示</p>
         </header>
 
         <div class="connection-status">
@@ -177,7 +176,7 @@
                 <div class="stat-value info" id="currentTable">全部</div>
             </div>
             <div class="stat-card">
-                <div class="stat-title">接收結果</div>
+                <div class="stat-title">總局數</div>
                 <div class="stat-value success" id="totalResults">0</div>
             </div>
             <div class="stat-card">
@@ -234,7 +233,6 @@
         let isConnected = false;
         let connectionStartTime = null;
         let firstResultTime = null;
-        let resultCount = 0;
         let errorCount = 0;
         let gameResults = [];
         let resultTimes = [];
@@ -249,6 +247,26 @@
 
         // Frontend store and deduplication
         const recordStore = new Map(); // key: tableId:roundId, value: { phase, hash, record }
+
+        // Update total games count based on availableTables data
+        function updateTotalGamesCount() {
+            let totalGames = 0;
+
+            if (currentTableId) {
+                // 計算特定桌號的局數
+                const targetTable = availableTables.find(table =>
+                    String(table.table_id) === String(currentTableId)
+                );
+                totalGames = targetTable ? (targetTable.total_games || 0) : 0;
+            } else {
+                // 計算全部桌號的局數 - 直接加總各桌的 total_games
+                totalGames = availableTables.reduce((sum, table) => {
+                    return sum + (table.total_games || 0);
+                }, 0);
+            }
+
+            elements.totalResults.textContent = totalGames;
+        }
 
         const elements = {
             status: document.getElementById('connectionStatus'),
@@ -386,7 +404,9 @@
             });
 
             if (newCount > 0) {
+                updateTotalGamesCount();
                 lastActivityTime = Date.now();
+                elements.lastUpdate.textContent = new Date().toLocaleTimeString();
                 updateGameTable();
             }
 
@@ -401,6 +421,7 @@
                 updateTableSelector();
                 updateTableTabs();
                 updateOverview();
+                updateTotalGamesCount();
                 elements.activeTables.textContent = data.total_tables || 0;
             } catch (error) {
                 console.error('獲取桌號失敗:', error);
@@ -507,7 +528,10 @@
                 if (activeTab) activeTab.classList.add('active');
                 elements.panelTitle.textContent = `遊戲結果 - ${tableId} (最新 30 筆)`;
             }
-            
+
+            // 更新總局數顯示
+            updateTotalGamesCount();
+
             refreshCurrentTable();
         }
 
@@ -524,7 +548,6 @@
                 const data = await response.json();
 
                 gameResults = [];
-                recordStore.clear(); // Clear store for full refresh
                 const records = data.records || [];
 
                 records.forEach(record => {
@@ -532,6 +555,7 @@
                 });
 
                 updateGameTable();
+                updateTotalGamesCount();
                 addEvent('system', `刷新${currentTableId || '全部'}桌號數據`, {
                     table: currentTableId || '全部',
                     count: records.length
@@ -590,12 +614,23 @@
                 elements.status.className = 'status-indicator connected';
                 elements.text.textContent = '已連接';
                 elements.connectBtn.textContent = '斷開';
-                
+
                 const connectTime = Date.now() - connectionStartTime;
                 elements.connectionTime.textContent = connectTime + 'ms';
-                
+
+                // 重置總局數計數器
+                recordStore.clear();
+                updateTotalGamesCount();
+
                 addEvent('system', '連接建立', { url: url, connectTime: connectTime });
-                
+
+                // 立即抽取歷史資料到 recordStore
+                // 使用 softRefresh 確保抓取全部桌號的最新資料
+                softRefresh().then(() => {
+                    updateTotalGamesCount();
+                    updateGameTable();
+                });
+
                 // 開始智能刷新
                 scheduleNextRefresh(); // 開始智能刷新調度
                 fetchTables(); // 立即獲取一次
@@ -672,25 +707,39 @@
         }
 
         function handleGameResult(data) {
-            resultCount++;
-            elements.totalResults.textContent = resultCount;
+            let accepted = 0;
 
-            // 更新最後時間
-            elements.lastUpdate.textContent = new Date().toLocaleTimeString();
-
-            // 處理遊戲結果數據
-            if (data.payload && data.payload.record) {
-                addGameResultFromSSE(data.payload.record);
-            } else if (data.payload && data.payload.results) {
-                for (const result of data.payload.results) {
-                    addGameResultFromSSE(result);
+            const take = (r) => {
+                try {
+                    if (applyRecord(r)) accepted++;
+                } catch (e) {
+                    console.error('applyRecord failed:', e);
                 }
-            } else if (data.payload) {
-                addGameResultFromSSE(data.payload);
+            };
+
+            // 解析 payload，逐筆採納
+            if (data && data.payload) {
+                if (data.payload.record) {
+                    take(data.payload.record);
+                } else if (Array.isArray(data.payload.results)) {
+                    data.payload.results.forEach(take);
+                } else {
+                    // 有些服務會直接把 record 放在 payload 根上
+                    take(data.payload);
+                }
             }
 
-            addEvent('result', `收到遊戲結果`, {
-                latency: data.latency_ms || 'N/A'
+            // 只有真的有變更，才更新統計與畫面
+            if (accepted > 0) {
+                updateTotalGamesCount();
+                lastActivityTime = Date.now();
+                elements.lastUpdate.textContent = new Date().toLocaleTimeString();
+                updateGameTable();
+            }
+
+            addEvent('result', '收到遊戲結果', {
+                latency: data.latency_ms || 'N/A',
+                accepted
             });
 
             // 刷新桌號列表（如果有新桌號）
@@ -933,16 +982,16 @@
         }
 
         function resetStats() {
-            resultCount = 0;
             errorCount = 0;
             resultTimes = [];
             firstResultTime = null;
             gameResults = [];
-            
-            elements.totalResults.textContent = '0';
+            recordStore.clear();
+
+            updateTotalGamesCount();
             elements.errorCount.textContent = '0';
             elements.lastUpdate.textContent = '--';
-            
+
             updateGameTable();
             clearResults();
         }
