@@ -671,83 +671,218 @@ class ExistingBrowserMonitor:
 
         context.on("request", _collector)
 
-        # 更強化的點擊「搜索/檢索」邏輯
+        # 更強化的點擊「搜索/檢索」邏輯 - 嚴格限定主內容區
         clicked = await page.evaluate("""
 (() => {
-  // 更廣泛的選擇器，包括可能的 Vue/Element UI 組件
-  const selectors = [
-    'button, input[type="button"], a[role="button"]',
-    '.el-button, .el-button--primary, .el-button--default',
-    '[class*="btn"], [class*="button"]',
-    'span[role="button"], div[role="button"]',
-    '*[onclick*="search"], *[onclick*="query"]'
-  ];
+  // 檢查元素是否可見且可互動
+  const isElementVisible = (el) => {
+    if (!el || !el.offsetParent) return false;
+    const style = window.getComputedStyle(el);
+    return style.display !== 'none' &&
+           style.visibility !== 'hidden' &&
+           style.pointerEvents !== 'none' &&
+           style.opacity !== '0';
+  };
 
-  let allCandidates = [];
-  for (const sel of selectors) {
-    try {
-      allCandidates.push(...document.querySelectorAll(sel));
-    } catch(e) {}
-  }
+  // 檢查父層是否為導航區域
+  const isInNavigationArea = (el) => {
+    let parent = el.parentElement;
+    let depth = 0;
+    while (parent && depth < 15) {
+      const className = (parent.className || '').toLowerCase();
+      const id = (parent.id || '').toLowerCase();
+      const combined = className + ' ' + id;
 
-  const txt = (el) => {
+      // 嚴格排除導航相關區域
+      if (/\b(aside|nav|navbar|navigation|sidebar|menu|drawer|collapse|left-panel|side-panel)\b/.test(combined)) {
+        console.debug('[SEARCH] Rejected - in navigation area:', combined);
+        return true;
+      }
+
+      // 檢查 data 屬性
+      const dataAttrs = Array.from(parent.attributes)
+        .filter(attr => attr.name.startsWith('data-'))
+        .map(attr => attr.value.toLowerCase())
+        .join(' ');
+      if (/\b(nav|sidebar|menu|drawer)\b/.test(dataAttrs)) {
+        console.debug('[SEARCH] Rejected - navigation data attr:', dataAttrs);
+        return true;
+      }
+
+      parent = parent.parentElement;
+      depth++;
+    }
+    return false;
+  };
+
+  // 檢查位置是否在左側區域
+  const isInLeftSideArea = (el) => {
+    const rect = el.getBoundingClientRect();
+    if (!rect) return true;
+
+    // 方法1: 左側1/3區域
+    if (rect.left < window.innerWidth / 3) {
+      console.debug('[SEARCH] Rejected - left 1/3 area:', rect.left, '< ', window.innerWidth / 3);
+      return true;
+    }
+
+    // 方法2: 固定像素排除（左側240px）
+    if (rect.left < 240) {
+      console.debug('[SEARCH] Rejected - left 240px area:', rect.left);
+      return true;
+    }
+
+    return false;
+  };
+
+  // 獲取元素文本內容
+  const getElementText = (el) => {
     const text = (el.innerText || el.textContent || el.value || '').trim();
     const title = (el.title || el.getAttribute('title') || '').trim();
     const ariaLabel = (el.getAttribute('aria-label') || '').trim();
-    return [text, title, ariaLabel].join(' ').toLowerCase();
+    const placeholder = (el.placeholder || el.getAttribute('placeholder') || '').trim();
+    return [text, title, ariaLabel, placeholder].join(' ').toLowerCase();
   };
 
-  // 尋找包含搜索相關文字的元素
-  const searchTerms = ['搜索', '查询', '搜尋', '查詢', '检索', '檢索', 'search', 'query', '搜', '查'];
-  const hit = allCandidates.find(el => {
-    const elementText = txt(el);
-    return searchTerms.some(term => elementText.includes(term.toLowerCase()));
+  // 更精確的按鈕選擇器
+  const buttonSelectors = [
+    'button',
+    'input[type="button"]',
+    'input[type="submit"]',
+    'a[role="button"]',
+    '[role="button"]',
+    '.el-button',
+    '.ant-btn',
+    '[class*="btn"]',
+    '[class*="button"]'
+  ];
+
+  // 收集所有候選按鈕
+  let allButtons = [];
+  buttonSelectors.forEach(selector => {
+    try {
+      allButtons.push(...document.querySelectorAll(selector));
+    } catch(e) {}
   });
 
-  if (hit) {
-    console.log('Found search button:', hit.outerHTML.substring(0, 100));
-    // 嘗試多種點擊方式
+  // 精確的搜索關鍵詞匹配
+  const searchKeywords = [
+    // 精確匹配（優先級最高）
+    { pattern: /^(檢索|检索)$/i, priority: 1, name: 'exact_retrieve' },
+    { pattern: /^(搜索|搜尋)$/i, priority: 2, name: 'exact_search' },
+    { pattern: /^(查詢|查询)$/i, priority: 3, name: 'exact_query' },
+    { pattern: /^search$/i, priority: 4, name: 'exact_search_en' },
+    { pattern: /^query$/i, priority: 5, name: 'exact_query_en' },
+
+    // 包含匹配（優先級較低）
+    { pattern: /檢索|检索/i, priority: 6, name: 'contains_retrieve' },
+    { pattern: /搜索|搜尋/i, priority: 7, name: 'contains_search' },
+    { pattern: /查詢|查询/i, priority: 8, name: 'contains_query' }
+  ];
+
+  // 按優先級篩選有效按鈕
+  const validButtons = [];
+
+  for (const button of allButtons) {
+    // 1. 檢查可見性
+    if (!isElementVisible(button)) {
+      console.debug('[SEARCH] Skip - not visible:', button.tagName, getElementText(button));
+      continue;
+    }
+
+    // 2. 檢查是否在導航區域
+    if (isInNavigationArea(button)) {
+      console.debug('[SEARCH] Skip - in navigation area:', getElementText(button));
+      continue;
+    }
+
+    // 3. 檢查位置
+    if (isInLeftSideArea(button)) {
+      console.debug('[SEARCH] Skip - in left area:', getElementText(button));
+      continue;
+    }
+
+    // 4. 檢查文本匹配
+    const buttonText = getElementText(button);
+    for (const keyword of searchKeywords) {
+      if (keyword.pattern.test(buttonText)) {
+        validButtons.push({
+          element: button,
+          text: buttonText,
+          priority: keyword.priority,
+          matchType: keyword.name,
+          rect: button.getBoundingClientRect()
+        });
+        console.debug('[SEARCH] Valid candidate:', keyword.name, buttonText, button.getBoundingClientRect().left);
+        break;
+      }
+    }
+  }
+
+  // 按優先級排序（優先級數字越小越優先）
+  validButtons.sort((a, b) => {
+    if (a.priority !== b.priority) return a.priority - b.priority;
+    // 同優先級下，選擇更靠右的（更可能在主內容區）
+    return b.rect.left - a.rect.left;
+  });
+
+  console.log('[SEARCH] Found valid buttons:', validButtons.length);
+  validButtons.forEach((btn, index) => {
+    console.log(`[SEARCH] ${index + 1}. ${btn.matchType}: "${btn.text}" at x:${btn.rect.left}`);
+  });
+
+  // 嘗試點擊最佳候選按鈕
+  if (validButtons.length > 0) {
+    const bestButton = validButtons[0];
+    console.log('[SEARCH] Clicking best button:', bestButton.matchType, bestButton.text);
+
     try {
-      hit.click();
+      bestButton.element.click();
       return true;
     } catch(e1) {
       try {
-        hit.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true}));
+        bestButton.element.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true}));
         return true;
       } catch(e2) {
         try {
-          // 如果是 Vue 組件，嘗試觸發事件
-          hit.dispatchEvent(new Event('click', {bubbles: true}));
+          bestButton.element.dispatchEvent(new Event('click', {bubbles: true}));
           return true;
         } catch(e3) {
-          console.log('All click methods failed:', e1, e2, e3);
+          console.error('[SEARCH] All click methods failed:', e1.message, e2.message, e3.message);
         }
       }
     }
   }
 
-  // 備案：嘗試找到並提交表單
+  // 備案1：嘗試主內容區的表單提交
   try {
-    const forms = document.querySelectorAll('form');
-    for (const form of forms) {
-      if (form.querySelector('input, button')) {
-        form.dispatchEvent(new Event('submit', {bubbles: true, cancelable: true}));
-        console.log('Submitted form as fallback');
-        return true;
+    const mainContentSelectors = ['main', '[role="main"]', '.main-content', '.content', '.page-content'];
+    for (const selector of mainContentSelectors) {
+      const mainArea = document.querySelector(selector);
+      if (mainArea) {
+        const forms = mainArea.querySelectorAll('form');
+        for (const form of forms) {
+          if (form.querySelector('input[type="search"], input[name*="search"], input[name*="query"]')) {
+            form.dispatchEvent(new Event('submit', {bubbles: true, cancelable: true}));
+            console.log('[SEARCH] Submitted form in main content area');
+            return true;
+          }
+        }
       }
     }
   } catch(e) {}
 
-  // 最後手段：按 Enter 鍵
+  // 備案2：Enter鍵（最後手段）
   try {
     document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', bubbles: true}));
-    console.log('Triggered Enter key as last resort');
+    console.log('[SEARCH] Triggered Enter key as fallback');
     return true;
   } catch(e) {}
 
-  console.log('No search button found. Available buttons:',
-    allCandidates.slice(0, 5).map(el => el.outerHTML.substring(0, 50))
-  );
+  console.warn('[SEARCH] No valid search button found in main content area');
+  console.log('[SEARCH] Total buttons checked:', allButtons.length);
+  console.log('[SEARCH] Valid buttons after filtering:', validButtons.length);
+
   return false;
 })()
 """)

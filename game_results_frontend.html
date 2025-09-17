@@ -155,6 +155,254 @@
             color: #666;
             font-weight: normal;
         }
+
+        /* ===== 導出模態框樣式 ===== */
+        .export-modal {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.8);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            z-index: 1000;
+            backdrop-filter: blur(4px);
+        }
+
+        .export-modal.hidden {
+            display: none;
+        }
+
+        .export-modal-content {
+            background: #2a2a2a;
+            border: 1px solid #444;
+            border-radius: 12px;
+            width: 90%;
+            max-width: 700px;
+            max-height: 90vh;
+            overflow-y: auto;
+            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.5);
+            animation: modalSlideIn 0.3s ease-out;
+        }
+
+        @keyframes modalSlideIn {
+            from { opacity: 0; transform: scale(0.9) translateY(-20px); }
+            to { opacity: 1; transform: scale(1) translateY(0); }
+        }
+
+        .export-modal-header {
+            background: #333;
+            padding: 20px;
+            border-bottom: 1px solid #444;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-radius: 12px 12px 0 0;
+        }
+
+        .export-modal-header h2 {
+            margin: 0;
+            color: #667eea;
+            font-size: 1.4rem;
+        }
+
+        .export-modal-close {
+            background: none;
+            border: none;
+            color: #888;
+            font-size: 24px;
+            cursor: pointer;
+            padding: 0;
+            width: 30px;
+            height: 30px;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            border-radius: 50%;
+            transition: all 0.2s;
+        }
+
+        .export-modal-close:hover {
+            background: rgba(239, 68, 68, 0.1);
+            color: #ef4444;
+        }
+
+        .export-modal-body {
+            padding: 20px;
+        }
+
+        .export-section {
+            margin-bottom: 25px;
+        }
+
+        .export-section h3 {
+            margin: 0 0 15px 0;
+            color: #fff;
+            font-size: 1.1rem;
+            font-weight: 600;
+        }
+
+        /* 格式選擇樣式 */
+        .format-options {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 12px;
+        }
+
+        .format-option {
+            cursor: pointer;
+        }
+
+        .format-option input[type="radio"] {
+            display: none;
+        }
+
+        .format-card {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 15px;
+            background: #1a1a1a;
+            border: 2px solid #333;
+            border-radius: 8px;
+            transition: all 0.2s;
+        }
+
+        .format-option input[type="radio"]:checked + .format-card {
+            border-color: #667eea;
+            background: rgba(102, 126, 234, 0.1);
+        }
+
+        .format-card:hover {
+            border-color: #555;
+            background: #252525;
+        }
+
+        .format-option input[type="radio"]:checked + .format-card:hover {
+            border-color: #667eea;
+            background: rgba(102, 126, 234, 0.15);
+        }
+
+        .format-icon {
+            font-size: 24px;
+            width: 40px;
+            height: 40px;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 6px;
+        }
+
+        .format-info {
+            flex: 1;
+        }
+
+        .format-title {
+            font-weight: 600;
+            color: #fff;
+            margin-bottom: 4px;
+        }
+
+        .format-desc {
+            font-size: 0.85rem;
+            color: #888;
+        }
+
+        /* 篩選條件樣式 */
+        .filter-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+        }
+
+        .filter-item {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+
+        .filter-item label {
+            font-size: 0.9rem;
+            color: #ccc;
+            font-weight: 500;
+        }
+
+        .filter-item select,
+        .filter-item input {
+            padding: 10px 12px;
+            background: #1a1a1a;
+            border: 1px solid #444;
+            border-radius: 6px;
+            color: #fff;
+            font-size: 0.9rem;
+            transition: border-color 0.2s;
+        }
+
+        .filter-item select:focus,
+        .filter-item input:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+
+        /* 預覽資訊樣式 */
+        .export-preview {
+            background: #1a1a1a;
+            border: 1px solid #333;
+            border-radius: 8px;
+            padding: 15px;
+        }
+
+        .preview-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+
+        .preview-item:last-child {
+            margin-bottom: 0;
+        }
+
+        .preview-label {
+            font-size: 0.9rem;
+            color: #888;
+            flex: 1;
+        }
+
+        .preview-value {
+            font-weight: 600;
+            color: #4ade80;
+            font-size: 0.9rem;
+        }
+
+        /* 模態框底部 */
+        .export-modal-footer {
+            background: #333;
+            padding: 20px;
+            border-top: 1px solid #444;
+            display: flex;
+            justify-content: flex-end;
+            gap: 12px;
+            border-radius: 0 0 12px 12px;
+        }
+
+        .export-modal-footer .btn {
+            min-width: 100px;
+        }
+
+        /* 載入動畫 */
+        .spinner {
+            display: inline-block;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            from { transform: rotate(0deg); }
+            to { transform: rotate(360deg); }
+        }
     </style>
 </head>
 <body>
@@ -167,8 +415,8 @@
             <div class="status-indicator" id="connectionStatus"></div>
             <span id="connectionText">未連接</span>
             <button class="btn btn-primary" id="connectBtn" onclick="toggleConnection()">連接</button>
-            <button class="btn btn-secondary" onclick="clearResults()">清空結果</button>
-            <button class="btn btn-secondary" onclick="resetStats()">重置統計</button>
+            <button class="btn btn-secondary" onclick="confirmClearResults()">清空結果</button>
+            <button class="btn btn-secondary" onclick="confirmResetStats()">重置統計</button>
             <button class="btn btn-secondary" onclick="refreshTables()">刷新桌號</button>
         </div>
 
@@ -181,6 +429,9 @@
             </div>
             <button class="btn btn-secondary btn-small" onclick="toggleOverview()">
                 <span id="overviewToggleText">總覽模式</span>
+            </button>
+            <button class="btn btn-primary btn-small" onclick="openExportModal()" title="導出資料">
+                📊 導出資料
             </button>
         </div>
 
@@ -270,6 +521,124 @@
                 </div>
             </div>
         </div>
+
+        <!-- 導出資料模態框 -->
+        <div id="exportModal" class="export-modal hidden">
+            <div class="export-modal-content">
+                <div class="export-modal-header">
+                    <h2>📊 導出資料</h2>
+                    <button class="export-modal-close" onclick="closeExportModal()">&times;</button>
+                </div>
+
+                <div class="export-modal-body">
+                    <!-- 導出格式選擇 -->
+                    <div class="export-section">
+                        <h3>1. 選擇格式</h3>
+                        <div class="format-options">
+                            <label class="format-option">
+                                <input type="radio" name="exportFormat" value="json" checked>
+                                <div class="format-card">
+                                    <div class="format-icon">📄</div>
+                                    <div class="format-info">
+                                        <div class="format-title">JSON</div>
+                                        <div class="format-desc">結構化資料，適合程式處理</div>
+                                    </div>
+                                </div>
+                            </label>
+                            <label class="format-option">
+                                <input type="radio" name="exportFormat" value="csv">
+                                <div class="format-card">
+                                    <div class="format-icon">📈</div>
+                                    <div class="format-info">
+                                        <div class="format-title">CSV</div>
+                                        <div class="format-desc">Excel 可開啟，適合分析</div>
+                                    </div>
+                                </div>
+                            </label>
+                            <label class="format-option">
+                                <input type="radio" name="exportFormat" value="excel">
+                                <div class="format-card">
+                                    <div class="format-icon">📊</div>
+                                    <div class="format-info">
+                                        <div class="format-title">Excel</div>
+                                        <div class="format-desc">多工作表，功能完整</div>
+                                    </div>
+                                </div>
+                            </label>
+                        </div>
+                    </div>
+
+                    <!-- 篩選條件 -->
+                    <div class="export-section">
+                        <h3>2. 篩選條件</h3>
+                        <div class="filter-grid">
+                            <div class="filter-item">
+                                <label for="exportTableId">桌號:</label>
+                                <select id="exportTableId">
+                                    <option value="">全部桌號</option>
+                                </select>
+                            </div>
+                            <div class="filter-item">
+                                <label for="exportStartDate">開始日期:</label>
+                                <input type="date" id="exportStartDate">
+                            </div>
+                            <div class="filter-item">
+                                <label for="exportEndDate">結束日期:</label>
+                                <input type="date" id="exportEndDate">
+                            </div>
+                            <div class="filter-item">
+                                <label for="exportStatus">狀態篩選:</label>
+                                <select id="exportStatus">
+                                    <option value="">全部狀態</option>
+                                    <option value="投注中">投注中</option>
+                                    <option value="開獎中">開獎中</option>
+                                    <option value="已結束">已結束</option>
+                                    <option value="已派彩">已派彩</option>
+                                </select>
+                            </div>
+                            <div class="filter-item">
+                                <label for="exportLimit">筆數限制:</label>
+                                <select id="exportLimit">
+                                    <option value="">不限制</option>
+                                    <option value="100">100 筆</option>
+                                    <option value="500">500 筆</option>
+                                    <option value="1000">1000 筆</option>
+                                    <option value="5000">5000 筆</option>
+                                    <option value="10000">10000 筆</option>
+                                </select>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- 預覽資訊 -->
+                    <div class="export-section">
+                        <h3>3. 預覽資訊</h3>
+                        <div class="export-preview">
+                            <div class="preview-item">
+                                <span class="preview-label">將導出:</span>
+                                <span class="preview-value" id="exportPreviewCount">計算中...</span>
+                            </div>
+                            <div class="preview-item">
+                                <span class="preview-label">桌號範圍:</span>
+                                <span class="preview-value" id="exportPreviewTables">--</span>
+                            </div>
+                            <div class="preview-item">
+                                <span class="preview-label">檔案大小預估:</span>
+                                <span class="preview-value" id="exportPreviewSize">--</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="export-modal-footer">
+                    <button class="btn btn-secondary" onclick="closeExportModal()">取消</button>
+                    <button class="btn btn-primary" onclick="startExport()" id="exportButton">
+                        <span id="exportButtonText">開始導出</span>
+                        <span id="exportButtonSpinner" class="spinner hidden">⟳</span>
+                    </button>
+                </div>
+            </div>
+        </div>
     </div>
 
     <script>
@@ -316,9 +685,20 @@
         let isPageStuck = false;
         let lastActivityTime = Date.now();
 
-        // 監控開始時間（頁面載入時間）
-        let monitoringStartTime = Date.now();
+        // 監控開始時間（連接成功後才開始計時）
+        let monitoringStartTime = null;
         let monitoringDurationInterval = null;
+
+        // 更新活動時間的通用函數
+        function updateActivityTime() {
+            lastActivityTime = Date.now();
+        }
+
+        // 監聽用戶交互事件以更新活動時間
+        document.addEventListener('click', updateActivityTime);
+        document.addEventListener('keydown', updateActivityTime);
+        document.addEventListener('scroll', updateActivityTime);
+        document.addEventListener('mousemove', updateActivityTime);
 
         // Frontend store and deduplication
         const recordStore = new Map(); // key: tableId:roundId, value: { phase, hash, record }
@@ -508,10 +888,22 @@
                     consecutiveErrors++;
                     console.error('Soft refresh failed:', error);
 
-                    // Check if page is stuck
+                    // Check if page is stuck (extended timeout and better conditions)
                     const now = Date.now();
-                    if (now - lastActivityTime > 60000) { // 1 minute of inactivity
-                        console.warn('Page appears stuck, triggering reload');
+                    const timeSinceLastActivity = now - lastActivityTime;
+                    const timeSincePageLoad = monitoringStartTime ? (now - monitoringStartTime) : 0;
+
+                    // Only check for stuck page if:
+                    // 1. Page has been running for at least 5 minutes
+                    // 2. No activity for more than 10 minutes
+                    // 3. Not currently connected or in error state
+                    if (timeSincePageLoad > 300000 && // 5 minutes since page load
+                        timeSinceLastActivity > 600000 && // 10 minutes of inactivity
+                        !isConnected && // not currently connected
+                        consecutiveErrors > 10) { // many consecutive errors
+                        console.warn('Page appears stuck after extended inactivity, triggering reload');
+                        console.log(`Time since last activity: ${(timeSinceLastActivity/1000/60).toFixed(1)} minutes`);
+                        console.log(`Consecutive errors: ${consecutiveErrors}`);
                         window.location.reload();
                     } else {
                         scheduleNextRefresh();
@@ -795,9 +1187,15 @@
                 const connectTime = Date.now() - connectionStartTime;
                 elements.connectionTime.textContent = connectTime + 'ms';
 
-                // 重置總局數計數器
+                // 重置總局數計數器和活動時間
                 recordStore.clear();
                 updateTotalGamesCount();
+                updateActivityTime(); // 重置活動時間
+                consecutiveErrors = 0; // 重置錯誤計數
+
+                // 開始監控計時
+                monitoringStartTime = Date.now();
+                startMonitoringTimer();
 
                 addEvent('system', '連接建立', { url: url, connectTime: connectTime });
 
@@ -869,17 +1267,20 @@
                 eventSource.close();
                 eventSource = null;
             }
-            
+
             if (refreshTimeoutId) {
                 clearTimeout(refreshTimeoutId);
                 refreshTimeoutId = null;
             }
-            
+
             isConnected = false;
             elements.status.className = 'status-indicator';
             elements.text.textContent = '已斷開';
             elements.connectBtn.textContent = '連接';
-            
+
+            // 停止監控計時
+            stopMonitoringTimer();
+
             addEvent('system', '連接斷開', {});
         }
 
@@ -1228,10 +1629,32 @@
             }
         }
 
+        // 確認清空結果
+        function confirmClearResults() {
+            if (confirm('🗑️ 確定要清空所有結果嗎？\n\n此操作將會：\n• 清除所有遊戲結果\n• 清空事件日誌\n\n此操作無法復原！')) {
+                clearResults();
+                addEvent('system', '用戶手動清空結果', {
+                    timestamp: new Date().toLocaleString(),
+                    action: 'clear_results'
+                });
+            }
+        }
+
         function clearResults() {
             gameResults = [];
             updateGameTable();
             elements.eventsList.innerHTML = '<div style="text-align: center; color: #888;">事件已清空</div>';
+        }
+
+        // 確認重置統計
+        function confirmResetStats() {
+            if (confirm('📊 確定要重置所有統計嗎？\n\n此操作將會：\n• 重置錯誤計數\n• 清空所有遊戲結果\n• 重置監控時間\n• 清空事件記錄\n\n此操作無法復原！')) {
+                resetStats();
+                addEvent('system', '用戶手動重置統計', {
+                    timestamp: new Date().toLocaleString(),
+                    action: 'reset_stats'
+                });
+            }
         }
 
         function resetStats() {
@@ -1273,6 +1696,10 @@
 
         // 更新監控時長
         function updateMonitoringDuration() {
+            if (monitoringStartTime === null) {
+                elements.monitoringDuration.textContent = '--';
+                return;
+            }
             const duration = Date.now() - monitoringStartTime;
             elements.monitoringDuration.textContent = formatDuration(duration);
         }
@@ -1286,14 +1713,348 @@
             updateMonitoringDuration(); // 立即更新一次
         }
 
-        // 重置監控時間（可選功能）
+        // 重置監控時間（只在連接時使用）
         function resetMonitoringTimer() {
-            monitoringStartTime = Date.now();
+            if (isConnected) {
+                monitoringStartTime = Date.now();
+            } else {
+                monitoringStartTime = null;
+            }
             updateMonitoringDuration();
         }
 
-        // 頁面載入時啟動監控定時器
-        startMonitoringTimer();
+        // 停止監控計時器
+        function stopMonitoringTimer() {
+            if (monitoringDurationInterval) {
+                clearInterval(monitoringDurationInterval);
+                monitoringDurationInterval = null;
+            }
+            monitoringStartTime = null;
+            updateMonitoringDuration();
+        }
+
+        // 初始化監控時長顯示（等待連接）
+        updateMonitoringDuration();
+
+        // ===== 資料導出功能 =====
+
+        // 導出相關變量
+        let exportPreviewTimer = null;
+        const INGEST_KEY = 'baccaratt9webapi'; // 從環境獲取或配置
+
+        // 打開導出模態框
+        function openExportModal() {
+            const modal = document.getElementById('exportModal');
+            modal.classList.remove('hidden');
+
+            // 初始化導出選項
+            initializeExportOptions();
+
+            // 更新預覽
+            updateExportPreview();
+
+            // 添加事件監聽器
+            addExportEventListeners();
+
+            addEvent('system', '打開導出面板', {});
+        }
+
+        // 關閉導出模態框
+        function closeExportModal() {
+            const modal = document.getElementById('exportModal');
+            modal.classList.add('hidden');
+
+            // 清理定時器
+            if (exportPreviewTimer) {
+                clearTimeout(exportPreviewTimer);
+                exportPreviewTimer = null;
+            }
+
+            // 重置按鈕狀態
+            resetExportButton();
+        }
+
+        // 初始化導出選項
+        function initializeExportOptions() {
+            // 設置默認日期（今天）
+            const today = new Date();
+            const todayString = today.toISOString().split('T')[0];
+            document.getElementById('exportEndDate').value = todayString;
+
+            // 設置默認開始日期（一週前）
+            const weekAgo = new Date(today.getTime() - 7 * 24 * 60 * 60 * 1000);
+            const weekAgoString = weekAgo.toISOString().split('T')[0];
+            document.getElementById('exportStartDate').value = weekAgoString;
+
+            // 填充桌號選項
+            const tableSelect = document.getElementById('exportTableId');
+            tableSelect.innerHTML = '<option value="">全部桌號</option>';
+
+            // 使用現有的 availableTables 數據
+            availableTables.forEach(table => {
+                const option = document.createElement('option');
+                option.value = table.table_id;
+                const displayTableId = mapTableId(table.table_id);
+                option.textContent = `${displayTableId} (${table.total_games} 局)`;
+                tableSelect.appendChild(option);
+            });
+
+            // 如果當前有選擇桌號，設為默認
+            if (currentTableId) {
+                tableSelect.value = currentTableId;
+            }
+        }
+
+        // 添加事件監聽器
+        function addExportEventListeners() {
+            // 監聽所有篩選條件變更
+            const filterInputs = [
+                'exportTableId', 'exportStartDate', 'exportEndDate',
+                'exportStatus', 'exportLimit'
+            ];
+
+            filterInputs.forEach(inputId => {
+                const input = document.getElementById(inputId);
+                if (input) {
+                    input.addEventListener('change', debounceUpdatePreview);
+                }
+            });
+
+            // 監聽格式選擇變更
+            const formatRadios = document.querySelectorAll('input[name="exportFormat"]');
+            formatRadios.forEach(radio => {
+                radio.addEventListener('change', updateExportPreview);
+            });
+        }
+
+        // 防抖更新預覽
+        function debounceUpdatePreview() {
+            if (exportPreviewTimer) {
+                clearTimeout(exportPreviewTimer);
+            }
+            exportPreviewTimer = setTimeout(updateExportPreview, 300);
+        }
+
+        // 更新導出預覽
+        async function updateExportPreview() {
+            try {
+                const filters = getExportFilters();
+                const format = getSelectedFormat();
+
+                // 構建預覽請求URL（只獲取計數，不實際導出）
+                const params = new URLSearchParams();
+                if (filters.table_id) params.set('table_id', filters.table_id);
+                if (filters.start_date) params.set('start_date', filters.start_date);
+                if (filters.end_date) params.set('end_date', filters.end_date);
+                if (filters.status_filter) params.set('status_filter', filters.status_filter);
+                if (filters.limit) params.set('limit', filters.limit);
+
+                // 使用現有的API獲取記錄數量預估
+                let apiUrl;
+                if (filters.table_id) {
+                    apiUrl = `http://127.0.0.1:8000/api/tables/${filters.table_id}?limit=1`;
+                } else {
+                    apiUrl = 'http://127.0.0.1:8000/api/latest?limit=1';
+                }
+
+                const response = await fetch(apiUrl);
+                if (response.ok) {
+                    const data = await response.json();
+                    let estimatedCount = data.total || 0;
+
+                    // 如果有限制條件，調整預估
+                    if (filters.limit && filters.limit < estimatedCount) {
+                        estimatedCount = filters.limit;
+                    }
+
+                    // 更新預覽顯示
+                    updatePreviewDisplay(estimatedCount, filters, format);
+                } else {
+                    updatePreviewDisplay(0, filters, format);
+                }
+
+            } catch (error) {
+                console.error('更新導出預覽失敗:', error);
+                updatePreviewDisplay(0, {}, getSelectedFormat());
+            }
+        }
+
+        // 更新預覽顯示
+        function updatePreviewDisplay(count, filters, format) {
+            // 更新記錄數量
+            document.getElementById('exportPreviewCount').textContent = `${count.toLocaleString()} 筆記錄`;
+
+            // 更新桌號範圍
+            let tableRange = '全部桌號';
+            if (filters.table_id) {
+                tableRange = mapTableId(filters.table_id);
+            } else if (availableTables.length > 0) {
+                const tableNames = availableTables.map(t => mapTableId(t.table_id)).sort();
+                if (tableNames.length <= 3) {
+                    tableRange = tableNames.join(', ');
+                } else {
+                    tableRange = `${tableNames[0]} ~ ${tableNames[tableNames.length - 1]} 等 ${tableNames.length} 桌`;
+                }
+            }
+            document.getElementById('exportPreviewTables').textContent = tableRange;
+
+            // 估算檔案大小（粗略估算）
+            let sizeEstimate = '計算中...';
+            if (count > 0) {
+                const bytesPerRecord = format === 'json' ? 800 : format === 'excel' ? 200 : 150;
+                const totalBytes = count * bytesPerRecord;
+
+                if (totalBytes < 1024) {
+                    sizeEstimate = `${totalBytes} B`;
+                } else if (totalBytes < 1024 * 1024) {
+                    sizeEstimate = `${(totalBytes / 1024).toFixed(1)} KB`;
+                } else {
+                    sizeEstimate = `${(totalBytes / (1024 * 1024)).toFixed(1)} MB`;
+                }
+            } else {
+                sizeEstimate = '0 B';
+            }
+            document.getElementById('exportPreviewSize').textContent = sizeEstimate;
+        }
+
+        // 獲取導出篩選條件
+        function getExportFilters() {
+            return {
+                table_id: document.getElementById('exportTableId').value || null,
+                start_date: document.getElementById('exportStartDate').value || null,
+                end_date: document.getElementById('exportEndDate').value || null,
+                status_filter: document.getElementById('exportStatus').value || null,
+                limit: document.getElementById('exportLimit').value ? parseInt(document.getElementById('exportLimit').value) : null
+            };
+        }
+
+        // 獲取選擇的格式
+        function getSelectedFormat() {
+            const formatRadio = document.querySelector('input[name="exportFormat"]:checked');
+            return formatRadio ? formatRadio.value : 'json';
+        }
+
+        // 開始導出
+        async function startExport() {
+            const exportButton = document.getElementById('exportButton');
+            const exportButtonText = document.getElementById('exportButtonText');
+            const exportButtonSpinner = document.getElementById('exportButtonSpinner');
+
+            try {
+                // 更新按鈕狀態
+                exportButton.disabled = true;
+                exportButtonText.textContent = '導出中...';
+                exportButtonSpinner.classList.remove('hidden');
+
+                const filters = getExportFilters();
+                const format = getSelectedFormat();
+
+                addEvent('system', '開始導出資料', {
+                    format: format.toUpperCase(),
+                    table: filters.table_id ? mapTableId(filters.table_id) : '全部',
+                    limit: filters.limit || '無限制'
+                });
+
+                // 構建API請求URL
+                const params = new URLSearchParams();
+                if (filters.table_id) params.set('table_id', filters.table_id);
+                if (filters.start_date) params.set('start_date', filters.start_date);
+                if (filters.end_date) params.set('end_date', filters.end_date);
+                if (filters.status_filter) params.set('status_filter', filters.status_filter);
+                if (filters.limit) params.set('limit', filters.limit.toString());
+
+                const apiUrl = `http://127.0.0.1:8000/api/export/${format}?${params.toString()}`;
+
+                // 發送導出請求
+                const response = await fetch(apiUrl, {
+                    method: 'GET',
+                    headers: {
+                        'x-ingest-key': INGEST_KEY
+                    }
+                });
+
+                if (!response.ok) {
+                    const errorText = await response.text().catch(() => '未知錯誤');
+                    throw new Error(`導出失敗: ${response.status} ${response.statusText} - ${errorText}`);
+                }
+
+                // 獲取檔案名稱
+                const contentDisposition = response.headers.get('content-disposition');
+                let filename = `t9_export_${format}_${new Date().toISOString().slice(0, 19).replace(/:/g, '-')}.${format}`;
+                if (contentDisposition && contentDisposition.includes('filename=')) {
+                    filename = contentDisposition.split('filename=')[1].replace(/"/g, '');
+                }
+
+                // 下載檔案
+                const blob = await response.blob();
+                const downloadUrl = window.URL.createObjectURL(blob);
+                const downloadLink = document.createElement('a');
+                downloadLink.href = downloadUrl;
+                downloadLink.download = filename;
+                document.body.appendChild(downloadLink);
+                downloadLink.click();
+                document.body.removeChild(downloadLink);
+                window.URL.revokeObjectURL(downloadUrl);
+
+                // 獲取導出統計
+                const totalRecords = response.headers.get('X-Total-Records') || '未知';
+                const fileSize = (blob.size / 1024).toFixed(1);
+
+                addEvent('system', '導出完成', {
+                    format: format.toUpperCase(),
+                    filename: filename,
+                    records: totalRecords,
+                    size: `${fileSize} KB`
+                });
+
+                // 重置按鈕狀態並關閉模態框
+                resetExportButton();
+                setTimeout(() => {
+                    closeExportModal();
+                }, 500); // 延遲500ms讓用戶看到成功狀態
+
+            } catch (error) {
+                console.error('導出錯誤:', error);
+                addEvent('error', '導出失敗', { error: error.message });
+
+                // 確保重置按鈕狀態
+                resetExportButton();
+            } finally {
+                // 無論成功或失敗都確保重置按鈕狀態
+                setTimeout(() => {
+                    resetExportButton();
+                }, 100);
+            }
+        }
+
+        // 重置導出按鈕狀態
+        function resetExportButton() {
+            const exportButton = document.getElementById('exportButton');
+            const exportButtonText = document.getElementById('exportButtonText');
+            const exportButtonSpinner = document.getElementById('exportButtonSpinner');
+
+            exportButton.disabled = false;
+            exportButtonText.textContent = '開始導出';
+            exportButtonSpinner.classList.add('hidden');
+        }
+
+        // 模態框點擊外部關閉
+        document.addEventListener('click', function(event) {
+            const modal = document.getElementById('exportModal');
+            if (event.target === modal) {
+                closeExportModal();
+            }
+        });
+
+        // ESC鍵關閉模態框
+        document.addEventListener('keydown', function(event) {
+            if (event.key === 'Escape') {
+                const modal = document.getElementById('exportModal');
+                if (!modal.classList.contains('hidden')) {
+                    closeExportModal();
+                }
+            }
+        });
 
         // 自動連接
         setTimeout(() => {

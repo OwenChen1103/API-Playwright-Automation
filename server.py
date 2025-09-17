@@ -11,16 +11,19 @@ import time
 import logging
 import os
 import hashlib
+import io
+import csv
 from typing import List, Optional, Dict, Any
-from datetime import datetime
+from datetime import datetime, date
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException, Query, Header
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException, Query, Header, Path
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse, JSONResponse, Response
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import redis
 from redis.exceptions import RedisError
+import pandas as pd
 
 # 載入環境變數
 load_dotenv()
@@ -874,6 +877,285 @@ async def debug_specific_table(table_id: str):
             }
 
     return debug_info
+
+
+# ===== 資料導出功能 =====
+
+def filter_records_by_criteria(
+    table_id: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    status_filter: Optional[str] = None,
+    limit: Optional[int] = None
+) -> List[Dict[str, Any]]:
+    """根據條件篩選記錄"""
+    all_records: List[Dict[str, Any]] = []
+
+    # 從 results_by_table 收集資料
+    target_tables = [table_id] if table_id else list(results_by_table.keys())
+
+    for tid in target_tables:
+        if tid not in results_by_table:
+            continue
+
+        table_rounds = results_by_table[tid]
+        for _, record in table_rounds.items():
+            all_records.append(record)
+
+    # 篩選條件
+    filtered_records = []
+
+    for record in all_records:
+        # 狀態篩選
+        if status_filter:
+            record_status = record.get("game_payment_status_name", "")
+            if status_filter.lower() not in record_status.lower():
+                continue
+
+        # 日期篩選（基於 game_start_time 或 ingested_at）
+        if start_date or end_date:
+            record_date_str = record.get("game_start_time") or record.get("ingested_at", "")
+            if record_date_str:
+                try:
+                    # 嘗試解析日期
+                    if "T" in record_date_str:
+                        record_date = datetime.fromisoformat(record_date_str.replace("Z", "+00:00")).date()
+                    else:
+                        record_date = datetime.strptime(record_date_str[:10], "%Y-%m-%d").date()
+
+                    if start_date:
+                        start_d = datetime.strptime(start_date, "%Y-%m-%d").date()
+                        if record_date < start_d:
+                            continue
+
+                    if end_date:
+                        end_d = datetime.strptime(end_date, "%Y-%m-%d").date()
+                        if record_date > end_d:
+                            continue
+                except (ValueError, TypeError):
+                    # 日期解析失敗，跳過此記錄
+                    continue
+
+        filtered_records.append(record)
+
+    # 排序（按 round_id 降序）
+    filtered_records.sort(
+        key=lambda x: int(x.get("round_id") or x.get("roundId") or 0),
+        reverse=True
+    )
+
+    # 限制數量
+    if limit and limit > 0:
+        filtered_records = filtered_records[:limit]
+
+    return filtered_records
+
+
+def prepare_export_data(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """準備導出資料，標準化欄位"""
+    export_data = []
+
+    for record in records:
+        # 解析遊戲結果
+        game_result = record.get("gameResult", {})
+        if isinstance(game_result, dict):
+            result_code = game_result.get("result", -1)
+            result_text = {
+                0: "莊勝",
+                1: "閒勝",
+                2: "和局",
+                3: "取消/無效",
+                -1: "進行中"
+            }.get(result_code, f"結果{result_code}")
+        else:
+            result_text = str(game_result) if game_result else "N/A"
+
+        # 標準化資料
+        export_record = {
+            "桌號": record.get("table_id") or record.get("tableId") or record.get("table", ""),
+            "局號": record.get("round_id") or record.get("roundId", ""),
+            "遊戲狀態": record.get("game_payment_status_name", "未知"),
+            "遊戲結果": result_text,
+            "開局時間": record.get("game_start_time", ""),
+            "接收時間": record.get("ingested_at", ""),
+            "結果代碼": game_result.get("result", -1) if isinstance(game_result, dict) else -1,
+            "狀態代碼": record.get("game_payment_status", -1),
+        }
+
+        # 加入其他有用的欄位
+        for key, value in record.items():
+            if key not in ["table_id", "tableId", "table", "round_id", "roundId",
+                          "game_payment_status_name", "gameResult", "game_start_time",
+                          "ingested_at", "game_payment_status"]:
+                if not isinstance(value, (dict, list)):
+                    export_record[f"原始_{key}"] = value
+
+        export_data.append(export_record)
+
+    return export_data
+
+
+async def export_to_json(records: List[Dict[str, Any]]) -> bytes:
+    """導出為 JSON 格式"""
+    export_data = prepare_export_data(records)
+
+    result = {
+        "export_info": {
+            "timestamp": datetime.now().isoformat(),
+            "total_records": len(export_data),
+            "format": "json"
+        },
+        "data": export_data
+    }
+
+    return json.dumps(result, ensure_ascii=False, indent=2).encode('utf-8')
+
+
+async def export_to_csv(records: List[Dict[str, Any]]) -> bytes:
+    """導出為 CSV 格式"""
+    export_data = prepare_export_data(records)
+
+    if not export_data:
+        return "沒有資料可導出\n".encode('utf-8-sig')
+
+    # 使用 StringIO 創建 CSV
+    output = io.StringIO()
+
+    # 獲取所有欄位名稱
+    fieldnames = list(export_data[0].keys())
+
+    writer = csv.DictWriter(output, fieldnames=fieldnames)
+    writer.writeheader()
+
+    for record in export_data:
+        writer.writerow(record)
+
+    # 使用 UTF-8 BOM 以確保 Excel 正確顯示中文
+    return output.getvalue().encode('utf-8-sig')
+
+
+async def export_to_excel(records: List[Dict[str, Any]]) -> bytes:
+    """導出為 Excel 格式"""
+    export_data = prepare_export_data(records)
+
+    if not export_data:
+        # 創建空的 Excel 檔案
+        df = pd.DataFrame([{"訊息": "沒有資料可導出"}])
+    else:
+        df = pd.DataFrame(export_data)
+
+    # 使用 BytesIO 創建 Excel 檔案
+    output = io.BytesIO()
+
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        if export_data:
+            # 依桌號分組創建多個工作表
+            tables = {}
+            for record in export_data:
+                table_id = record.get("桌號", "未知桌號")
+                if table_id not in tables:
+                    tables[table_id] = []
+                tables[table_id].append(record)
+
+            # 總覽工作表
+            df.to_excel(writer, sheet_name='總覽', index=False)
+
+            # 各桌工作表
+            for table_id, table_records in tables.items():
+                if len(table_records) > 0:
+                    table_df = pd.DataFrame(table_records)
+                    # Excel 工作表名稱不能超過31字符
+                    sheet_name = f"桌號_{table_id}"[:31]
+                    table_df.to_excel(writer, sheet_name=sheet_name, index=False)
+        else:
+            df.to_excel(writer, sheet_name='空資料', index=False)
+
+    output.seek(0)
+    return output.read()
+
+
+# API 端點：資料導出
+@app.get("/api/export/{format}")
+async def export_data(
+    format: str = Path(..., regex="^(json|csv|excel)$"),
+    table_id: Optional[str] = Query(None, description="指定桌號"),
+    start_date: Optional[str] = Query(None, description="開始日期 (YYYY-MM-DD)"),
+    end_date: Optional[str] = Query(None, description="結束日期 (YYYY-MM-DD)"),
+    status_filter: Optional[str] = Query(None, description="狀態篩選"),
+    limit: Optional[int] = Query(None, ge=1, le=10000, description="限制筆數 (最多10000)"),
+    x_ingest_key: Optional[str] = Header(None, alias="x-ingest-key")
+):
+    """
+    資料導出 API
+
+    支援格式：
+    - json: JSON 格式
+    - csv: CSV 格式（適合 Excel）
+    - excel: Excel 格式（多工作表）
+
+    篩選條件：
+    - table_id: 指定桌號
+    - start_date/end_date: 日期範圍
+    - status_filter: 狀態篩選（模糊匹配）
+    - limit: 限制筆數
+    """
+    # 驗證 API Key
+    expected_key = os.getenv("INGEST_KEY", "baccaratt9webapi")
+    if x_ingest_key != expected_key:
+        raise HTTPException(status_code=401, detail="Invalid export key")
+
+    try:
+        # 篩選資料
+        filtered_records = filter_records_by_criteria(
+            table_id=table_id,
+            start_date=start_date,
+            end_date=end_date,
+            status_filter=status_filter,
+            limit=limit
+        )
+
+        logger.info(f"Export request: format={format}, table_id={table_id}, "
+                   f"date_range={start_date} to {end_date}, status={status_filter}, "
+                   f"limit={limit}, found={len(filtered_records)} records")
+
+        # 根據格式導出
+        if format == "json":
+            content = await export_to_json(filtered_records)
+            media_type = "application/json"
+            filename = f"t9_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+
+        elif format == "csv":
+            content = await export_to_csv(filtered_records)
+            media_type = "text/csv"
+            filename = f"t9_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+
+        elif format == "excel":
+            content = await export_to_excel(filtered_records)
+            media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            filename = f"t9_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+
+        else:
+            raise HTTPException(status_code=400, detail="Unsupported format")
+
+        # 更新指標
+        metrics.increment_counter("exports_total")
+        metrics.increment_counter(f"exports_{format}")
+
+        return Response(
+            content=content,
+            media_type=media_type,
+            headers={
+                "Content-Disposition": f"attachment; filename={filename}",
+                "X-Total-Records": str(len(filtered_records)),
+                "X-Export-Format": format,
+                "X-Export-Timestamp": datetime.now().isoformat()
+            }
+        )
+
+    except Exception as e:
+        logger.error(f"Export error: {e}")
+        metrics.record_error("export_error", str(e))
+        raise HTTPException(status_code=500, detail=f"Export failed: {str(e)}")
 
 
 # 事件統計
